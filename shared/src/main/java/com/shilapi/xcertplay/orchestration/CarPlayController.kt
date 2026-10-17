@@ -359,6 +359,7 @@ class CarPlayController(
                 "AirPlay session active controller=${session.controllerId ?: "unknown"} " +
                     "peer=${session.host}",
             )
+            notifyObserver { onSessionActive() }
             uiListener?.onSessionActive(session)
         }
 
@@ -378,6 +379,7 @@ class CarPlayController(
                     nowPlayingListener?.invoke(cleared)
                     if (wasPlaying) playbackListener?.invoke(false)
                 }
+                notifyObserver { onSessionEnded() }
             }
             debugLog("AirPlay session ended peer=${session.host}")
             uiListener?.onSessionEnded(session)
@@ -436,6 +438,7 @@ class CarPlayController(
                 armWirelessHandoffWatchdog(wirelessGeneration.get())
                 maybeCompleteWirelessHandoff()
             }
+            notifyObserver { onCommand(type, params) }
             uiListener?.onCommand(session, type, params)
         }
 
@@ -808,6 +811,13 @@ class CarPlayController(
             nowPlayingListener?.invoke(update)
             if (playingChanged) playbackListener?.invoke(update.playing)
         }
+        notifyObserver { onIap2Frame(frame) }
+    }
+
+    /** The host's observer runs on iAP2 and RTSP threads; its failures never reach CarPlay. */
+    private inline fun notifyObserver(event: CarPlayEventObserver.() -> Unit) {
+        runCatching { (appContext as? CarPlayEventObserverProvider)?.carPlayEventObserver?.event() }
+            .onFailure { debugLog("CarPlay event observer failed: ${it.javaClass.simpleName}") }
     }
 
     enum class InitialAlbumRefreshResult { SENT, FAILED, CLOSED, INACTIVE_SESSION, CANCELLED, CHANNEL_UNAVAILABLE }

@@ -8,11 +8,6 @@ import org.junit.Test
 class SettingsLayoutSourceRulesTest {
     private val sources = File("src/main/java/com/shilapi/xcertplay").listFiles { f -> f.extension == "kt" }!!
 
-    @Test fun blockGapsUseTheNamedConstant() {
-        val literal = Regex("""(bottom|top)Margin = dp\((16|18|20)\)""")
-        assertEquals(emptyList<String>(), hits(File(sources.first().parentFile, "DiPlayActivity.kt"), literal))
-    }
-
     @Test fun sizesAreNotPixelConstants() {
         val pixelConstant = Regex("""\b[A-Z][A-Z0-9_]*_PX\b""")
         assertEquals(emptyList<String>(), sources.flatMap { hits(it, pixelConstant) })

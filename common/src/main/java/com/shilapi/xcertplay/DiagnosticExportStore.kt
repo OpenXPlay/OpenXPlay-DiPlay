@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
+import com.shilapi.xcertplay.host.R
 import androidx.annotation.RequiresApi
 import androidx.core.content.FileProvider
 import java.io.File
@@ -39,7 +40,7 @@ internal object DiagnosticExportStore {
     fun saveWithoutPicker(context: Context, fileName: String, report: String): SavedReport {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             try {
-                return SavedReport(saveToDownloads(context.contentResolver, fileName, report))
+                return SavedReport(saveToDownloads(context, fileName, report))
             } catch (error: Exception) {
                 // Preserve the report even when the OEM's public storage provider is absent.
                 Log.w(TAG, "MediaStore Downloads unavailable; trying the public folder directly", error)
@@ -101,19 +102,19 @@ internal object DiagnosticExportStore {
         sdkInt < Build.VERSION_CODES.Q && !canWritePublicDownloads(context, sdkInt)
 
     @Suppress("DEPRECATION")
-    fun publicDownloadsDirectory(): File =
-        File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "DiPlay")
+    fun publicDownloadsDirectory(context: Context): File =
+        File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), context.getString(R.string.diagnostics_folder_name))
 
     internal fun saveToPublicDownloads(context: Context, fileName: String, report: String): SavedReport {
-        val directory = publicDownloadsDirectory()
-        if (!directory.isDirectory && !directory.mkdirs()) throw IOException("Downloads/DiPlay is unavailable")
+        val directory = publicDownloadsDirectory(context)
+        if (!directory.isDirectory && !directory.mkdirs()) throw IOException("${directory.path} is unavailable")
         val base = fileName.removeSuffix(".txt")
         var file = File(directory, fileName)
         var copy = 1
         while (file.exists()) file = File(directory, "$base-${copy++}.txt")
         try {
             file.writeText(report, Charsets.UTF_8)
-            if (file.length() == 0L && report.isNotEmpty()) throw IOException("Downloads/DiPlay did not keep the report")
+            if (file.length() == 0L && report.isNotEmpty()) throw IOException("${directory.path} did not keep the report")
         } catch (error: Exception) {
             file.delete()
             throw error
@@ -127,7 +128,7 @@ internal object DiagnosticExportStore {
         } catch (error: IllegalArgumentException) {
             // Some storage layouts resolve Downloads outside the provider's external root.
             // Share a private copy instead; the visible file in Downloads/DiPlay stays.
-            Log.w(TAG, "Downloads/DiPlay is not shareable through the provider; sharing a private copy", error)
+            Log.w(TAG, "${directory.path} is not shareable through the provider; sharing a private copy", error)
             privateShareCopy(context, fileName, report)
         }
         return SavedReport(uri, savedPath = file.absolutePath)
@@ -142,11 +143,12 @@ internal object DiagnosticExportStore {
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)
-    fun saveToDownloads(resolver: ContentResolver, fileName: String, report: String): Uri {
+    fun saveToDownloads(context: Context, fileName: String, report: String): Uri {
+        val resolver = context.contentResolver
         val values = ContentValues().apply {
             put(MediaStore.Downloads.DISPLAY_NAME, fileName)
             put(MediaStore.Downloads.MIME_TYPE, "text/plain")
-            put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/DiPlay")
+            put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/${context.getString(R.string.diagnostics_folder_name)}")
             put(MediaStore.Downloads.IS_PENDING, 1)
         }
         val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)

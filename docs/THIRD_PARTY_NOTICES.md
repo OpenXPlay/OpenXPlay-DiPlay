@@ -6,9 +6,7 @@ DiPlay is a modified version of [xcertplay by shilapi](https://github.com/shilap
 
 Upstream credits [LIVI](https://github.com/f-io/LIVI) and [Showcase](https://github.com/amineross/showcase) for protocol research. Existing source comments and attribution are preserved.
 
-## Home and settings UI
-
-`common/src/main/java/com/shilapi/xcertplay/DiPlayActivity.kt` adapts the palette, visual arrangement and interface copy of the [DiAuto project](https://github.com/shihabal3amri/DiAuto). DiAuto's source is licensed under AGPL version 3. The UI file is marked AGPL-3.0-only; its license text is included in `docs/licenses/DiAuto-AGPL-3.0.txt`.
+This fork removes the home/settings UI and download website that upstream DiPlay adapts from [DiAuto](https://github.com/shihabal3amri/DiAuto) (AGPL-3.0).
 
 ## CarPlay icon
 
@@ -43,10 +41,6 @@ Concentus uses the Opus BSD-style license. The full copyright notices, redistrib
 ## Experimental authentication data
 
 The public preview APK includes an accessory certificate/key pair recovered from public Carlinkit C2Air Allwinner V821 firmware during the owner's local investigation. These data are not newly generated Apple-issued credentials for DiPlay and are not relicensed as project source code. They are bundled in the preview APK to reproduce the offline experiment; continued acceptance and suitability for general distribution are unresolved. The source archive does not contain the private key, and the separate Android APK-signing key is never distributed.
-
-## Download website
-
-The static site layout, CSS and generator adapt DiAuto (AGPL-3.0). The AGPL license text is included with the source.
 
 ## BYD HUD maneuver icons
 

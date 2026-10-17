@@ -1,14 +1,11 @@
 package com.shilapi.xcertplay
 
 import android.app.Activity
-import android.content.Intent
-import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.os.Looper
 import android.view.View
-import android.widget.LinearLayout
 import com.shilapi.xcertplay.media.CarPlayNowPlaying
 import java.io.File
 import java.time.Duration
@@ -108,33 +105,9 @@ class ClusterMusicTest {
         assertEquals(150, ClusterMusicSettings.size(context))
     }
 
-    @Test fun rendersRealSettingsCompactFullAndRtlWithLargeFontsAndClusterCard() {
-        for ((locale, width) in listOf("es" to 600, "es" to 1280, "ar" to 600)) {
-            RuntimeEnvironment.setQualifiers("$locale-w${width}dp-h960dp")
-            val old = Configuration(context.resources.configuration)
-            context.resources.updateConfiguration(Configuration(old).apply { fontScale = 1.5f }, context.resources.displayMetrics)
-            ClusterMusicSettings.saveEnabled(context, true)
-            val controller = Robolectric.buildActivity(DiPlayActivity::class.java,
-                Intent(context, DiPlayActivity::class.java).putExtra("page", "settings")).setup()
-            val activity = controller.get()
-            activity.applicationInfo.flags = activity.applicationInfo.flags or android.content.pm.ApplicationInfo.FLAG_SUPPORTS_RTL
-            val card = LinearLayout(activity).apply {
-                orientation = LinearLayout.VERTICAL
-                setBackgroundColor(Color.rgb(20, 27, 38))
-                layoutDirection = if (locale == "ar") View.LAYOUT_DIRECTION_RTL else View.LAYOUT_DIRECTION_LTR
-            }
-            ReflectionHelpers.callInstanceMethod<Unit>(activity, "clusterMusicControls",
-                ReflectionHelpers.ClassParameter(LinearLayout::class.java, card))
-            val px = (width * context.resources.displayMetrics.density).toInt()
-            card.measure(View.MeasureSpec.makeMeasureSpec(px, View.MeasureSpec.EXACTLY),
-                View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED))
-            card.layout(0, 0, card.measuredWidth, card.measuredHeight)
-            for (i in 0 until card.childCount) assertTrue(card.getChildAt(i).height > 0)
-            write(card, "$locale-$width-settings")
-            controller.pause().stop().destroy()
-            context.resources.updateConfiguration(old, context.resources.displayMetrics)
-        }
+    @Test fun rendersClusterCardAndCoverOnlyAfterCaptionExpires() {
         RuntimeEnvironment.setQualifiers("es")
+        ClusterMusicSettings.saveEnabled(context, true)
         ClusterMusicSettings.savePermanent(context, true)
         val controller = Robolectric.buildActivity(Activity::class.java).setup().visible()
         val card = ClusterMusicView(controller.get())

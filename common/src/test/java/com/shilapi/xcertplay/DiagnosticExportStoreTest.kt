@@ -15,6 +15,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 import org.robolectric.shadows.ShadowContentResolver
+import com.shilapi.xcertplay.host.R
 import java.io.File
 import java.io.IOException
 
@@ -32,9 +33,17 @@ class DiagnosticExportStoreTest {
         ShadowContentResolver.registerProviderInternal("media", provider)
     }
 
+    @Test fun defaultBrandingAndFolderCopyRemainDiPlay() {
+        val context = RuntimeEnvironment.getApplication()
+        val folder = context.getString(R.string.diagnostics_folder_name)
+        assertEquals("DiPlay", folder)
+        assertEquals("DiPlay", context.getString(R.string.accessory_device_name))
+        assertEquals(folder, DiagnosticExportStore.publicDownloadsDirectory(context).name)
+    }
+
     @Test fun android10SavesUtf8ReportToDownloadsAndPublishesAfterClosingIt() {
         val report = "DiPlay · diagnostic report\nVideo: H.264\n"
-        val uri = DiagnosticExportStore.saveToDownloads(resolver, "DiPlay-test.txt", report)
+        val uri = DiagnosticExportStore.saveToDownloads(RuntimeEnvironment.getApplication(), "DiPlay-test.txt", report)
         assertEquals(provider.uri, uri)
         assertEquals(report, provider.file.readText())
         assertEquals("Download/DiPlay", provider.insertValues!!.getAsString(MediaStore.Downloads.RELATIVE_PATH))
@@ -48,7 +57,7 @@ class DiagnosticExportStoreTest {
     @Test fun unavailableDownloadsDoesNotReturnFalseSuccess() {
         provider.refuseInsert = true
         assertThrows(IOException::class.java) {
-            DiagnosticExportStore.saveToDownloads(resolver, "test.txt", "report")
+            DiagnosticExportStore.saveToDownloads(RuntimeEnvironment.getApplication(), "test.txt", "report")
         }
         assertNull(provider.publishValues)
         assertFalse(provider.deleted)
@@ -57,7 +66,7 @@ class DiagnosticExportStoreTest {
     @Test fun deniedWriteRemovesOnlyTheNewPendingEntry() {
         provider.denyWrite = true
         assertThrows(SecurityException::class.java) {
-            DiagnosticExportStore.saveToDownloads(resolver, "test.txt", "report")
+            DiagnosticExportStore.saveToDownloads(RuntimeEnvironment.getApplication(), "test.txt", "report")
         }
         assertTrue(provider.deleted)
         assertNull(provider.publishValues)
@@ -66,7 +75,7 @@ class DiagnosticExportStoreTest {
     @Test fun failedPublishDoesNotLeaveAnInvisibleReport() {
         provider.refusePublish = true
         assertThrows(IOException::class.java) {
-            DiagnosticExportStore.saveToDownloads(resolver, "test.txt", "report")
+            DiagnosticExportStore.saveToDownloads(RuntimeEnvironment.getApplication(), "test.txt", "report")
         }
         assertTrue(provider.deleted)
     }

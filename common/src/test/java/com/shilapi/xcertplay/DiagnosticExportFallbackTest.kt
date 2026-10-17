@@ -27,7 +27,7 @@ class DiagnosticExportFallbackTest {
     private val context get() = RuntimeEnvironment.getApplication()
     private val reports get() = File(context.getExternalFilesDir(null)!!, "diagnostic-reports")
     private val privateReports get() = File(context.filesDir, "diagnostic-reports")
-    private val publicReports get() = DiagnosticExportStore.publicDownloadsDirectory()
+    private val publicReports get() = DiagnosticExportStore.publicDownloadsDirectory(context)
 
     @Before fun cleanReports() {
         reports.deleteRecursively()

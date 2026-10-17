@@ -88,7 +88,9 @@ import com.shilapi.xcertplay.airplay.AirPlaySafeArea
 import com.shilapi.xcertplay.airplay.AirPlaySession
 import com.shilapi.xcertplay.airplay.AirPlaySessionListener
 import com.shilapi.xcertplay.airplay.CarPlayMediaEngine
+import com.shilapi.xcertplay.airplay.MediaSinkDecoratorProvider
 import com.shilapi.xcertplay.airplay.SafeAreaRect
+import com.shilapi.xcertplay.airplay.SessionControl
 import com.shilapi.xcertplay.host.R
 import com.shilapi.xcertplay.location.AndroidCarPlayLocationProvider
 import com.shilapi.xcertplay.media.AndroidMediaSink
@@ -150,6 +152,7 @@ class CarPlayHostActivity : ComponentActivity() {
         val triggerDelayMillis: Int,
     )
 
+    private var hostOverlay: View? = null
     private var connectionPanel: View? = null
     private var connectionInstructionsView: TextView? = null
     private var connectionHelpView: TextView? = null
@@ -206,7 +209,8 @@ class CarPlayHostActivity : ComponentActivity() {
         label = "DiPlay",
         hostName = "diplay-" + DiPlayBootstrap.deviceId(airPlayIdentity).replace(":", "").lowercase(),
         hostMac = DiPlayBootstrap.deviceId(airPlayIdentity).split(":").map { it.toInt(16).toByte() }.toByteArray(),
-        wirelessBluetoothDeviceAddress = DiPlayPreferences.phoneAddress(this),
+        wirelessBluetoothDeviceAddress = (application as? CarPlayPhoneProvider)?.carPlayPhoneAddress()
+            ?: DiPlayPreferences.phoneAddress(this),
         transport = if (wirelessEnabled) CarPlayTransport.WIRELESS else CarPlayTransport.WIRED,
         wirelessHotspotMode = wirelessHotspotMode,
         wifiP2pPreferredChannel = AirPlayPersistence.loadWifiP2pPreferredChannel(this),
@@ -436,7 +440,7 @@ class CarPlayHostActivity : ComponentActivity() {
     private var safeAreaEditorActive = false
     private var externalActivityInProgress = false
     private var sink: AndroidMediaSink? = null
-    private var controller: CarPlayController? = null
+    @Volatile private var controller: CarPlayController? = null
     private val videoSurfaceOwner = CarPlayVideoSurfaceOwner<Surface>(
         detach = { surface ->
             sink?.clearSurface(SCREEN_TYPE_MAIN, surface)
@@ -808,6 +812,14 @@ class CarPlayHostActivity : ComponentActivity() {
         loadPersistedSettings()
         locationPermissionAvailable = hasFineLocationPermission()
         setContentView(buildContentView())
+        hostOverlay = (application as? CarPlayHostOverlayProvider)?.carPlayHostOverlay(this)
+        hostOverlay?.let { overlay ->
+            // Host menus remain above the optional app content and keep their existing handling.
+            val menu = settingsMenu
+            val content = menu?.parent as? ViewGroup ?: findViewById<ViewGroup>(android.R.id.content)
+            content.addView(overlay, if (menu != null && menu.parent === content) content.indexOfChild(menu) else content.childCount,
+                FrameLayout.LayoutParams(-1, -1))
+        }
         applyFullscreenMode()
         onBackPressedDispatcher.addCallback(
             this,
@@ -1841,6 +1853,8 @@ class CarPlayHostActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        hostOverlay?.let { (it.parent as? ViewGroup)?.removeView(it) }
+        hostOverlay = null
         mainHandler.removeCallbacks(hideTemporarySystemBars)
         discardLastPicture()
         if (pictureCopyThreadStarted) pictureCopyThread.quitSafely()
@@ -4926,7 +4940,7 @@ class CarPlayHostActivity : ComponentActivity() {
         val carBluetoothAudio = AirPlayPersistence.loadCarBluetoothAudio(this)
         if (carBluetoothAudio) logCarBluetoothAudio()
         return AirPlayConfig(
-            deviceName = "DiPlay",
+            deviceName = getString(R.string.accessory_device_name),
             deviceId = DiPlayBootstrap.deviceId(airPlayIdentity),
             btMac = DiPlayBluetooth.localAddress(this) ?: DiPlayBootstrap.deviceId(airPlayIdentity),
             sourceVersion = "950.7.1",
@@ -5172,7 +5186,8 @@ class CarPlayHostActivity : ComponentActivity() {
 
     private fun createMediaEngine(sink: AndroidMediaSink): CarPlayMediaEngine =
         CarPlayMediaEngine(
-            sink = sink,
+            sink = (application as? MediaSinkDecoratorProvider)?.mediaSinkDecorator
+                ?.decorate(sink, SessionControl { contacts -> controller?.sendTouch(contacts) ?: false }) ?: sink,
             microphoneEnabled = microphoneAvailable,
             audioCaptureDirectory = audioCaptureDirectory(),
         )
@@ -5596,7 +5611,9 @@ class CarPlayHostActivity : ComponentActivity() {
 
     private fun scheduleDisplaySize(width: Int, height: Int) {
         if (width <= 0 || height <= 0 || shuttingDown.get()) return
-        val size = DisplaySize(width, height)
+        val size = (application as? CarPlayCanvasProvider)?.carPlayCanvas()
+            ?.let { (canvasWidth, canvasHeight) -> DisplaySize(canvasWidth, canvasHeight) }
+            ?: DisplaySize(width, height)
         if (size == pendingDisplaySize) return
         mainHandler.removeCallbacks(applyDisplaySize)
         if (size == activeDisplaySize && !displayLayoutChanged()) {

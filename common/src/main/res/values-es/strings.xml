@@ -190,6 +190,8 @@
     <string name="diagnostics">Diagnóstico</string>
     <string name="discard_changes_and_exit_settings">Descartar cambios y salir de los ajustes</string>
     <string name="disconnect">Desconectar</string>
+    <string name="session_notification_channel">Conexión de CarPlay</string>
+    <string name="session_notification_text">Conexión de CarPlay activa</string>
     <string name="discovering_iphone">Buscando iPhone</string>
     <string name="display_and_performance">Pantalla y rendimiento</string>
     <string name="done">Listo</string>

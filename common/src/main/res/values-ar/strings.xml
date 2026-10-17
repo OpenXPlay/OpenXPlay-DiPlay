@@ -190,6 +190,8 @@
     <string name="diagnostics">التشخيص</string>
     <string name="discard_changes_and_exit_settings">تجاهل التغييرات والخروج من الإعدادات</string>
     <string name="disconnect">قطع الاتصال</string>
+    <string name="session_notification_channel">اتصال CarPlay</string>
+    <string name="session_notification_text">اتصال CarPlay قيد التشغيل</string>
     <string name="discovering_iphone">جارٍ اكتشاف iPhone</string>
     <string name="display_and_performance">العرض والأداء</string>
     <string name="done">تم</string>

@@ -4772,6 +4772,8 @@ class CarPlayHostActivity : ComponentActivity() {
             "Decoder capability query failed error=${error.javaClass.simpleName}")
     }
 
+    private var providerViewAreasInUse = false
+
     private fun createAirPlayConfig(size: DisplaySize): AirPlayConfig {
         // The home settings page can change the name while this host stays alive.
         if (!menuOpen) oemLabel = AirPlayPersistence.loadOemLabel(this)
@@ -4914,8 +4916,12 @@ class CarPlayHostActivity : ComponentActivity() {
             ), dock, splitWindow, startPortrait = size.height > size.width, sidePanel = SidePanelSettings.enabled(this),
                 rightHandDrive = rightHandDrive)
         }
-        pendingViewAreas = viewAreas
-        val declared = if (viewAreas == null) canvas else canvas.copy(viewAreas = viewAreas.areas, initialViewArea = viewAreas.current)
+        val providerAreas = (application as? CarPlayViewAreaProvider)
+            ?.carPlayViewAreas(canvas.widthPixels, canvas.heightPixels)?.takeIf { it.isNotEmpty() }?.toList()
+        providerViewAreasInUse = providerAreas != null
+        pendingViewAreas = if (providerViewAreasInUse) null else viewAreas
+        val declared = if (providerAreas != null) canvas.copy(viewAreas = providerAreas, initialViewArea = 0)
+            else if (viewAreas == null) canvas else canvas.copy(viewAreas = viewAreas.areas, initialViewArea = viewAreas.current)
         if (square != null) appendLog("Turning screen: square canvas ${square}x$square, areas ${viewAreas?.areas}")
         if (SplitScreenSettings.enabled(this) && !inSplitScreen) {
             appendLog("Split screen expected from status bar=$statusBar navigation bar=$navigationBar divider=$divider px")
@@ -5187,7 +5193,10 @@ class CarPlayHostActivity : ComponentActivity() {
     private fun createMediaEngine(sink: AndroidMediaSink): CarPlayMediaEngine =
         CarPlayMediaEngine(
             sink = (application as? MediaSinkDecoratorProvider)?.mediaSinkDecorator
-                ?.decorate(sink, SessionControl { contacts -> controller?.sendTouch(contacts) ?: false }) ?: sink,
+                ?.decorate(sink, object : SessionControl {
+                    override fun sendTouch(contacts: List<com.shilapi.xcertplay.airplay.AirPlayContact>) = controller?.sendTouch(contacts) ?: false
+                    override fun showViewArea(index: Int) = controller?.showViewArea(index) ?: false
+                }) ?: sink,
             microphoneEnabled = microphoneAvailable,
             audioCaptureDirectory = audioCaptureDirectory(),
         )
@@ -5694,6 +5703,7 @@ class CarPlayHostActivity : ComponentActivity() {
      * a turn without a square canvas), which the usual path handles.
      */
     private fun applyViewArea(size: DisplaySize, display: CarPlaySessionDisplay): Boolean {
+        if (providerViewAreasInUse) return false
         val areas = display.viewAreas ?: return false
         if (controller == null || menuOpen || handshakeResetInProgress || shuttingDown.get()) return false
         val split = isMultiWindowActive()

@@ -7,6 +7,8 @@ package com.shilapi.xcertplay.airplay
 fun interface SessionControl {
     /** Returns false when no session accepts the input. Coordinates are normalized to [0, 1]. */
     fun sendTouch(contacts: List<AirPlayContact>): Boolean
+    /** Queues a switch to a declared area; false when unavailable. */
+    fun showViewArea(index: Int): Boolean = false
 }
 
 /** Called once per session before its media engine starts; returning the supplied sink is valid. */

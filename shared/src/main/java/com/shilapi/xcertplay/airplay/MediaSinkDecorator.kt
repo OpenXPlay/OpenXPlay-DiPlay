@@ -9,6 +9,12 @@ fun interface SessionControl {
     fun sendTouch(contacts: List<AirPlayContact>): Boolean
     /** Queues a switch to a declared area; false when unavailable. */
     fun showViewArea(index: Int): Boolean = false
+    /**
+     * 发一次 CarPlay media HID 按压（index 取自 [CarPlayMediaButton]），不可用时返回 false。
+     * 车机方向盘/中控按键以 [org.openxplay.stream.core.ControlEvent.Key] 到达，
+     * 需要通过这个通道送到 iPhone，而不是走车机自己的播放器。
+     */
+    fun sendMediaButton(index: Int): Boolean = false
 }
 
 /** Called once per session before its media engine starts; returning the supplied sink is valid. */

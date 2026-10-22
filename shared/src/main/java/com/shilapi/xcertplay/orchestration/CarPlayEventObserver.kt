@@ -6,10 +6,19 @@ package com.shilapi.xcertplay.orchestration
 import com.shilapi.xcertplay.iap2.wire.Iap2Frame
 
 /**
- * Read-only CarPlay events for a host app. Calls arrive on iAP2 and RTSP threads, so they must
+ * Read-only CarPlay events for a host app. Calls arrive on main, iAP2 and RTSP threads, so they must
  * return quickly and never block; an exception is logged and does not affect CarPlay.
  */
 interface CarPlayEventObserver {
+    /** Every connection status DiPlay shows in its own UI, in order, on the main thread. */
+    fun onStatus(status: CarPlayStatus) {}
+
+    /**
+     * Progress lines of the wireless iAP2 bring-up (identification, authentication, Wi-Fi configuration,
+     * StartSession) as DiPlay writes them to its debug log; free text, so hosts must filter before display.
+     */
+    fun onProgress(message: String) {}
+
     /** A CarPlay session started recording; may repeat for the same session. */
     fun onSessionActive() {}
 

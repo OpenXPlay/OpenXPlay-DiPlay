@@ -1553,6 +1553,7 @@ class CarPlayController(
                 onProgress = { message ->
                     diagnostics.controlProgress(message)
                     debugLog(message)
+                    notifyObserver { onProgress(message) }
                 },
             )
             if (isStaleWirelessRun(generation)) {
@@ -3006,6 +3007,7 @@ class CarPlayController(
                 connectionDiagnostic("stage=${status.javaClass.simpleName}")
                 uiListener?.onDebugLog(status.debugLogMessage())
                 uiStatusReporter?.invoke(status)
+                notifyObserver { onStatus(status) }
             }
         }
     }

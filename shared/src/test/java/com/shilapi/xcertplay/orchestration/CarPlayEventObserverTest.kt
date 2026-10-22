@@ -4,6 +4,7 @@
 package com.shilapi.xcertplay.orchestration
 
 import android.app.Application
+import android.os.Looper
 import com.shilapi.xcertplay.airplay.AirPlayConfig
 import com.shilapi.xcertplay.airplay.AirPlayDisplayConfig
 import com.shilapi.xcertplay.airplay.AirPlayIdentity
@@ -21,6 +22,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
+import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.LooperMode
 
@@ -31,6 +33,8 @@ class CarPlayEventObserverTest {
     class RecordingApplication : Application(), CarPlayEventObserverProvider {
         val events = mutableListOf<String>()
         override val carPlayEventObserver = object : CarPlayEventObserver {
+            override fun onStatus(status: CarPlayStatus) { events += "status:${status.javaClass.simpleName}" }
+            override fun onProgress(message: String) { events += "progress:$message" }
             override fun onSessionActive() { events += "active" }
             override fun onSessionEnded() { events += "ended" }
             override fun onIap2Frame(frame: Iap2Frame) {
@@ -44,6 +48,8 @@ class CarPlayEventObserverTest {
 
     class ThrowingApplication : Application(), CarPlayEventObserverProvider {
         override val carPlayEventObserver = object : CarPlayEventObserver {
+            override fun onStatus(status: CarPlayStatus) = throw IllegalStateException("observer")
+            override fun onProgress(message: String) = throw IllegalStateException("observer")
             override fun onSessionActive() = throw IllegalStateException("observer")
             override fun onSessionEnded() = throw IllegalStateException("observer")
             override fun onIap2Frame(frame: Iap2Frame) = throw IllegalStateException("observer")
@@ -55,6 +61,7 @@ class CarPlayEventObserverTest {
     private val config = AirPlayConfig("test", "test", "", "1", AirPlayDisplayConfig(800, 480))
     private val identity = AirPlayIdentity(ByteArray(32), ByteArray(32), "test")
     private val hostEvents = mutableListOf<String>()
+    private val hostStatuses = mutableListOf<CarPlayStatus>()
     private val sessions = mutableListOf<AirPlaySession>()
     private lateinit var controller: CarPlayController
 
@@ -71,7 +78,7 @@ class CarPlayEventObserverTest {
                     hostEvents += "command:$type"
                 }
             },
-            object : AirPlayMediaHandler {}, {})
+            object : AirPlayMediaHandler {}, { hostStatuses += it })
     }
 
     private fun phone() = AirPlaySession(Socket(), config, identity, PairingStore(), null,
@@ -86,6 +93,51 @@ class CarPlayEventObserverTest {
     private fun route(frame: Iap2Frame) {
         CarPlayController::class.java.getDeclaredMethod("onRouteFrame", Iap2Frame::class.java)
             .apply { isAccessible = true }.invoke(controller, frame)
+    }
+
+    private fun status(status: CarPlayStatus) {
+        CarPlayController::class.java.getDeclaredMethod("onStatus", CarPlayStatus::class.java, Int::class.javaObjectType)
+            .apply { isAccessible = true }.invoke(controller, status, null)
+    }
+
+    private fun progress(message: String) {
+        val event: CarPlayEventObserver.() -> Unit = { onProgress(message) }
+        CarPlayController::class.java.getDeclaredMethod("notifyObserver", Function1::class.java)
+            .apply { isAccessible = true }.invoke(controller, event)
+    }
+
+    @Test
+    @Config(application = RecordingApplication::class)
+    fun applicationObserverReceivesDeduplicatedStatusesAndProgress() {
+        start()
+        status(CarPlayStatus.DiscoveringMfi)
+        status(CarPlayStatus.DiscoveringMfi)
+        status(CarPlayStatus.WaitingForMfi)
+
+        val application = RuntimeEnvironment.getApplication() as RecordingApplication
+        assertEquals(emptyList<String>(), application.events)
+        shadowOf(Looper.getMainLooper()).idle()
+        progress("identification complete")
+
+        assertEquals(listOf("status:DiscoveringMfi", "status:WaitingForMfi", "progress:identification complete"),
+            application.events)
+        assertEquals(listOf(CarPlayStatus.DiscoveringMfi, CarPlayStatus.WaitingForMfi), hostStatuses)
+    }
+
+    @Test
+    @Config(application = ThrowingApplication::class)
+    fun throwingStatusAndProgressObserverLeavesTheControllerPathIntact() {
+        start()
+        status(CarPlayStatus.DiscoveringMfi)
+        status(CarPlayStatus.DiscoveringMfi)
+        status(CarPlayStatus.WaitingForMfi)
+        shadowOf(Looper.getMainLooper()).idle()
+        progress("identification complete")
+        runSession()
+
+        assertEquals(listOf(CarPlayStatus.DiscoveringMfi, CarPlayStatus.WaitingForMfi), hostStatuses)
+        assertEquals(listOf("active", "command:requestUI", "ended", "ended"), hostEvents)
+        assertNull(activeSession())
     }
 
     /** A session runs, then a replaced session and the current one end. */

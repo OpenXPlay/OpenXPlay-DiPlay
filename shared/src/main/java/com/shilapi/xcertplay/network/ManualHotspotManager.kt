@@ -33,11 +33,13 @@ class ManualHotspotManager(
     security: ManualHotspotSecurity,
     private val onDiagnostic: (String) -> Unit = {},
     private val isCancelled: () -> Boolean = { false },
+    private val validateRadio: Boolean = false,
 ) : WirelessHotspotManager {
     private val appContext = context.applicationContext
     private val interfaces = ManualHotspotInterfaces(appContext, onDiagnostic)
     private val waitLock = Object()
     private var confirmed: HotspotSelection? = null
+    private var radioSnapshot: HotspotRadioSnapshot? = null
     private var lastSampleLog = emptyList<String>()
     private val wifiManager = appContext.getSystemService(WifiManager::class.java)
         ?: throw IllegalStateException("WifiManager is unavailable")
@@ -148,6 +150,8 @@ class ManualHotspotManager(
             )
         }
         val observedBandLabel = wifiBandLabel(apConfiguration?.band)
+        if (validateRadio) radioSnapshot = HotspotRadioSnapshot(apConfiguration?.ssid, apConfiguration?.security,
+            channel, localInterface.hardwareAddress)
         return WirelessHotspotInfo(
             ssid = expectedSsid,
             passphrase = passphrase,
@@ -172,10 +176,26 @@ class ManualHotspotManager(
         val expected = confirmed ?: throw WirelessStartupException(
             WirelessStartupFailure.HOTSPOT_NOT_READY, "Hotspot network is not ready",
         )
-        val current = selectHotspotInterface(interfaces.sample(), onDiagnostic)
+        val current = selectHotspotInterface(interfaces.sample(), if (validateRadio) ({ _ -> }) else onDiagnostic)
         if (closed || isCancelled() || current == null || !expected.sameAddress(current)) {
             throw WirelessStartupException(WirelessStartupFailure.HOTSPOT_NOT_READY,
                 "Hotspot interface or address changed before publication")
+        }
+        if (validateRadio) {
+            val read = readApConfiguration()
+            val companion = read != null && isFiveGhzCompanion(read.ssid, expectedSsid)
+            val configuration = read.takeUnless { companion }
+            val iface = NetworkInterface.getByName(current.name)
+            val bssid = runCatching { iface?.hardwareAddress?.toMacAddressString() }.getOrNull()
+                ?: HotspotInterfaceBssid.read(current.name)
+            val local = LocalHotspotInterface(current.name, current.address, bssid)
+            val channel = observedManualHotspotChannel(configuration?.channel ?: 0,
+                if (companion) null else frequencyFromConnectionInfo(),
+                if (companion) null else frequencyFromScanResult(local), configuration?.frequencyMHz)
+            if (radioSnapshot?.changed(HotspotRadioSnapshot(configuration?.ssid, configuration?.security, channel, bssid)) == true) {
+                throw WirelessStartupException(WirelessStartupFailure.HOTSPOT_NOT_READY,
+                    "Hotspot radio configuration changed; rebuilding wireless CarPlay")
+            }
         }
     }
 

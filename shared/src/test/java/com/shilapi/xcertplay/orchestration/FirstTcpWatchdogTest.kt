@@ -123,4 +123,35 @@ class FirstTcpWatchdogTest {
             assertEquals(1, outcomes.get())
         }
     }
+
+    @Test fun optInSessionDeadlineDoesNotExtendOnRepeatedTcpAccepts() {
+        var sessionFailures = 0
+        val watch = FirstTcpWatchdog(identity, { delay, action ->
+            deadline = now + delay; timer = action; { deadline = null }
+        }, { failures++ }, { now * 1_000_000 }, sessionTimeoutMillis = 20_000,
+            onSessionTimeout = { sessionFailures++ })
+        watch.startSessionSent(0)
+        now = 5_000
+        watch.accepted(event())
+        assertEquals(25_000L, deadline)
+        now = 10_000
+        watch.accepted(event())
+        assertEquals(25_000L, deadline)
+        timer!!()
+        assertEquals(1, sessionFailures)
+        assertEquals(0, failures)
+        assertFalse(watch.sessionEstablished())
+    }
+
+    @Test fun establishedSessionAndCancellationRejectQueuedSessionTimeouts() {
+        for (established in listOf(true, false)) {
+            val watch = FirstTcpWatchdog(identity, { _, action -> timer = action; {} },
+                { failures++ }, sessionTimeoutMillis = 20_000)
+            watch.accepted(event())
+            val queued = timer!!
+            if (established) watch.sessionEstablished() else watch.terminate()
+            queued()
+            assertEquals(0, failures)
+        }
+    }
 }

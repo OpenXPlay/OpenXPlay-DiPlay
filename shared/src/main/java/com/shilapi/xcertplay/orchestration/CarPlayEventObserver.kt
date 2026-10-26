@@ -36,3 +36,9 @@ interface CarPlayEventObserver {
 interface CarPlayEventObserverProvider {
     val carPlayEventObserver: CarPlayEventObserver?
 }
+
+/** Implemented by an app's Application to show its own UI when CarPlay asks for the car's UI. */
+interface CarPlayHostUiHandler {
+    /** Any thread; return quickly. True when the app handled it, so DiPlay does not open the launcher. */
+    fun onHostUiRequested(): Boolean
+}

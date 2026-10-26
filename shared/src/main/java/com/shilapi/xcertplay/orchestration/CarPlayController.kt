@@ -398,16 +398,23 @@ class CarPlayController(
             uiListener?.onDeviceInfo(session, info)
         }
 
-        // The user tapped the car icon in CarPlay: show the head unit's own menu, like its Home button.
-        // The session keeps running in the background, so returning to DiPlay resumes CarPlay.
+        // The user tapped the car icon in CarPlay: let the host app show its UI before falling back to Home.
+        // The session keeps running in the background.
         override fun onHostUiRequested(session: AirPlaySession) {
-            debugLog("CarPlay requested the car UI; opening the head-unit home screen")
-            runCatching {
-                appContext.startActivity(
-                    Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                )
-            }.onFailure { debugLog("Car home screen could not open: ${it.javaClass.simpleName}") }
+            val handledByHost = runCatching {
+                (appContext as? CarPlayHostUiHandler)?.onHostUiRequested() == true
+            }.onFailure { debugLog("Car UI handler failed: ${it.javaClass.simpleName}") }.getOrDefault(false)
+            if (handledByHost) {
+                debugLog("CarPlay requested the car UI; handled by the host app")
+            } else {
+                debugLog("CarPlay requested the car UI; opening the head-unit home screen")
+                runCatching {
+                    appContext.startActivity(
+                        Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                    )
+                }.onFailure { debugLog("Car home screen could not open: ${it.javaClass.simpleName}") }
+            }
             uiListener?.onHostUiRequested(session)
         }
 

@@ -4,6 +4,7 @@
 package com.shilapi.xcertplay.orchestration
 
 import android.app.Application
+import android.content.Intent
 import android.os.Looper
 import com.shilapi.xcertplay.airplay.AirPlayConfig
 import com.shilapi.xcertplay.airplay.AirPlayDisplayConfig
@@ -18,6 +19,7 @@ import java.net.Socket
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -30,7 +32,7 @@ import org.robolectric.annotation.LooperMode
 @Config(sdk = [29], manifest = Config.NONE)
 @LooperMode(LooperMode.Mode.PAUSED)
 class CarPlayEventObserverTest {
-    class RecordingApplication : Application(), CarPlayEventObserverProvider {
+    open class RecordingApplication : Application(), CarPlayEventObserverProvider {
         val events = mutableListOf<String>()
         override val carPlayEventObserver = object : CarPlayEventObserver {
             override fun onStatus(status: CarPlayStatus) { events += "status:${status.javaClass.simpleName}" }
@@ -43,6 +45,18 @@ class CarPlayEventObserverTest {
             override fun onCommand(type: String, params: Map<String, Any?>) {
                 events += "command:$type:${params["url"]}"
             }
+        }
+    }
+
+    class HostUiApplication : RecordingApplication(), CarPlayHostUiHandler {
+        var handled = true
+        var failure: RuntimeException? = null
+        var requests = 0
+
+        override fun onHostUiRequested(): Boolean {
+            requests++
+            failure?.let { throw it }
+            return handled
         }
     }
 
@@ -74,6 +88,7 @@ class CarPlayEventObserverTest {
             object : AirPlaySessionListener {
                 override fun onSessionActive(session: AirPlaySession) { hostEvents += "active" }
                 override fun onSessionEnded(session: AirPlaySession) { hostEvents += "ended" }
+                override fun onHostUiRequested(session: AirPlaySession) { hostEvents += "host-ui" }
                 override fun onCommand(session: AirPlaySession, type: String, params: Map<String, Any?>) {
                     hostEvents += "command:$type"
                 }
@@ -181,6 +196,69 @@ class CarPlayEventObserverTest {
 
         assertEquals(listOf("active", "command:requestUI", "ended", "ended"), hostEvents)
         assertNull(activeSession())
+    }
+
+    @Test
+    @Config(application = HostUiApplication::class)
+    fun handledHostUiRequestSkipsLauncherAndKeepsEventDelivery() {
+        requestHostUiAndCommand()
+
+        val application = RuntimeEnvironment.getApplication() as HostUiApplication
+        assertEquals(1, application.requests)
+        assertNull(shadowOf(application).nextStartedActivity)
+    }
+
+    @Test
+    @Config(application = HostUiApplication::class)
+    fun declinedHostUiRequestOpensLauncherAndKeepsEventDelivery() {
+        val application = RuntimeEnvironment.getApplication() as HostUiApplication
+        application.handled = false
+
+        requestHostUiAndCommand()
+
+        assertEquals(1, application.requests)
+        assertLauncherOpened()
+    }
+
+    @Test
+    @Config(application = HostUiApplication::class)
+    fun throwingHostUiHandlerOpensLauncherAndKeepsEventDelivery() {
+        val application = RuntimeEnvironment.getApplication() as HostUiApplication
+        application.failure = IllegalStateException("host UI")
+
+        requestHostUiAndCommand()
+
+        assertEquals(1, application.requests)
+        assertLauncherOpened()
+    }
+
+    @Test
+    @Config(application = RecordingApplication::class)
+    fun applicationWithoutHostUiHandlerOpensLauncherAndKeepsEventDelivery() {
+        requestHostUiAndCommand()
+
+        assertLauncherOpened()
+    }
+
+    private fun requestHostUiAndCommand() {
+        start()
+        val session = phone()
+        val listener = sessionListener()
+        listener.onHostUiRequested(session)
+        listener.onCommand(session, "requestUI", emptyMap())
+
+        val application = RuntimeEnvironment.getApplication() as RecordingApplication
+        assertEquals(listOf("host-ui", "command:requestUI"), hostEvents)
+        assertEquals(listOf("command:requestUI:null"), application.events)
+    }
+
+    private fun assertLauncherOpened() {
+        val application = RuntimeEnvironment.getApplication() as RecordingApplication
+        val intent = requireNotNull(shadowOf(application).nextStartedActivity)
+        assertEquals(Intent.ACTION_MAIN, intent.action)
+        assertTrue(intent.hasCategory(Intent.CATEGORY_HOME))
+        assertTrue(intent.flags and Intent.FLAG_ACTIVITY_NEW_TASK != 0)
+        assertNull(shadowOf(application).nextStartedActivity)
     }
 
     @After

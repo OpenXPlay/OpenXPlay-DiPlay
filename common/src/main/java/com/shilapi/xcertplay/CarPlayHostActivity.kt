@@ -5196,6 +5196,7 @@ class CarPlayHostActivity : ComponentActivity() {
                 ?.decorate(sink, object : SessionControl {
                     override fun sendTouch(contacts: List<com.shilapi.xcertplay.airplay.AirPlayContact>) = controller?.sendTouch(contacts) ?: false
                     override fun showViewArea(index: Int) = controller?.showViewArea(index) ?: false
+                    override fun sendMediaButton(index: Int) = controller?.sendMediaButton(index) ?: false
                 }) ?: sink,
             microphoneEnabled = microphoneAvailable,
             audioCaptureDirectory = audioCaptureDirectory(),

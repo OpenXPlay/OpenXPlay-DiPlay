@@ -183,6 +183,8 @@ class CarPlayController(
     private enum class Phase { IDLE, MFI, WIRELESS, IPHONE, REENUMERATION, DATAPATHS, CONTROL }
 
     private val appContext = context.applicationContext
+    private val wirelessNetworkRecovery =
+        (appContext as? WirelessConnectionPolicyProvider)?.wirelessNetworkRecoveryEnabled == true
     private val diagnosticAttempt = diagnosticAttempts.incrementAndGet()
     private val diagnosticRun = AtomicInteger()
     private val usbManager: UsbManager? = context.getSystemService(UsbManager::class.java)
@@ -272,6 +274,7 @@ class CarPlayController(
     private val wirelessFailureReported = AtomicBoolean(false)
     @Volatile private var instantBluetoothLink: InstantBluetoothLink? = null
     @Volatile private var firstTcpWatchdog: FirstTcpWatchdog? = null
+    @Volatile private var wirelessNetworkValidation: (() -> Unit)? = null
     @Volatile private var wirelessPublishedAddress: InetAddress? = null
     @Volatile private var wirelessAlternateAddress: InetAddress? = null
     @Volatile private var wirelessAddressRecovery: HotspotAddressRecovery? = null
@@ -1278,6 +1281,14 @@ class CarPlayController(
                     }
                 },
                 log = { debugLog("wireless startup generation=$generation listener=${listenerIdentity.id} $it") },
+                sessionTimeoutMillis = if (wirelessNetworkRecovery) WirelessStartupPolicy.SESSION_READY_MILLIS else null,
+                onSessionTimeout = {
+                    if (!isStaleWirelessRun(generation)) {
+                        fail(IOException("AirPlay session timed out after first TCP"), generation)
+                        Thread({ closeWirelessStack(generation = generation) }, "diplay-session-cleanup")
+                            .apply { isDaemon = true; start() }
+                    }
+                },
             )
             firstTcpWatchdog = watchdog
             val mfi = mfiSession?.client
@@ -1294,6 +1305,11 @@ class CarPlayController(
             }
             pauseWifiScans(hotspotInfo.backend)
             val startedHotspot = hotspot
+            val validateNetwork = wirelessNetworkValidator(generation, hotspotInfo, startedHotspot)
+            synchronized(wirelessResourceLock) {
+                if (isStaleWirelessRun(generation)) return
+                wirelessNetworkValidation = validateNetwork
+            }
             wirelessConnectionProof.begin(generation) {
                 if (!isStaleWirelessRun(generation)) startedHotspot?.onCarPlayConfirmed()
             }
@@ -1387,7 +1403,7 @@ class CarPlayController(
                 ?: throw IOException("Could not bind the CarPlay AirPlay service")
             synchronized(wirelessResourceLock) {
                 if (isStaleWirelessRun(generation)) return
-                startedHotspot?.validateReady()
+                validateNetwork()
                 when (
                     val result = service.attachWireless(
                         bindAddress = hostAddress,
@@ -1436,12 +1452,13 @@ class CarPlayController(
             synchronized(wirelessResourceLock) {
                 if (isStaleWirelessRun(generation)) return
                 bonjour = bonjourClient
-                startedHotspot?.validateReady()
+                validateNetwork()
                 bonjourClient.start()
             }
             startedBonjour = bonjourClient
             diagnostics.start()
             debugLog("wireless Bonjour services started mode=interface iface=${hotspotInfo.interfaceName ?: "unknown"}")
+            if (wirelessNetworkRecovery) watchWirelessNetwork(generation, validateNetwork)
             if (isStaleWirelessRun(generation)) {
                 return
             }
@@ -1545,7 +1562,7 @@ class CarPlayController(
                 "wireless Bluetooth iAP2 bootstrap starting " +
                     "location=false vehicleStatus=false",
             )
-            startedHotspot?.validateReady()
+            validateNetwork()
             val result = Iap2WirelessControlClient(
                 session = channel,
                 mfi = Iap2MfiAuthenticationClient(mfi),
@@ -1554,7 +1571,7 @@ class CarPlayController(
                 endpoint = endpoint,
                 timeoutMillis = controlLoopTimeoutMillis(),
                 keepAliveAfterDeadline = { keepBluetoothControlAlive(generation) },
-                beforeStartSession = { startedHotspot?.validateReady() },
+                beforeStartSession = validateNetwork,
                 onStartSessionSent = { watchdog.startSessionSent(it.sentAtNanos) },
                 onIncoming = ::onRouteFrame,
                 onProgress = { message ->
@@ -1562,6 +1579,7 @@ class CarPlayController(
                     debugLog(message)
                     notifyObserver { onProgress(message) }
                 },
+                beforeWifiConfiguration = { if (wirelessNetworkRecovery) validateNetwork() },
             )
             if (isStaleWirelessRun(generation)) {
                 return
@@ -1619,6 +1637,47 @@ class CarPlayController(
         }
     }
 
+    private fun wirelessNetworkValidator(generation: Int, info: WirelessHotspotInfo,
+        manager: WirelessHotspotManager?): () -> Unit {
+        val index = if (wirelessNetworkRecovery) info.interfaceName?.let {
+            runCatching { NetworkInterface.getByName(it)?.index }.getOrNull()
+        } else null
+        return {
+            if (isStaleWirelessRun(generation)) throw java.io.InterruptedIOException("Wireless attempt ended")
+            manager?.validateReady()
+            if (wirelessNetworkRecovery && info.interfaceName != null) {
+                val current = NetworkInterface.getByName(info.interfaceName)
+                val addresses = current?.let { java.util.Collections.list(it.inetAddresses) }.orEmpty()
+                if (current == null || !current.isUp || index != null && current.index != index ||
+                    info.hostAddresses.any { it !in addresses }) {
+                    throw WirelessStartupException(WirelessStartupFailure.HOTSPOT_NOT_READY,
+                        "Wireless interface or address changed; rebuilding CarPlay")
+                }
+            }
+        }
+    }
+
+    private fun watchWirelessNetwork(generation: Int, validateNetwork: () -> Unit) {
+        Thread({
+            var failures = 0
+            while (!isStaleWirelessRun(generation)) {
+                try {
+                    validateNetwork()
+                    failures = 0
+                } catch (error: Exception) {
+                    if (isStaleWirelessRun(generation)) return@Thread
+                    // A transient/redacted platform read must not drop a usable session.
+                    if (++failures >= WirelessStartupPolicy.STABLE_SAMPLES) {
+                        fail(error, generation)
+                        closeWirelessStack(generation = generation)
+                        return@Thread
+                    }
+                }
+                try { Thread.sleep(1_000) } catch (_: InterruptedException) { return@Thread }
+            }
+        }, "diplay-wireless-network-watch").apply { isDaemon = true; start() }
+    }
+
     private fun startWirelessTunnelControl(stream: BlockingDuplexByteStream): Boolean {
         if (closed || config.transport != CarPlayTransport.WIRELESS) return false
         val identification = wirelessRuntimeIdentification ?: return false
@@ -1638,6 +1697,7 @@ class CarPlayController(
         }
         wirelessTunnelChannel = channel
         val generation = wirelessGeneration.get()
+        val validateNetwork = wirelessNetworkValidation
         debugLog(
             "wireless iAP2 runtime tunnel control starting " +
                 "location=${identification.locationInformationEnabled} " +
@@ -1660,6 +1720,8 @@ class CarPlayController(
                         },
                         onIncoming = ::onRouteFrame,
                         onProgress = { message -> debugLog("iAP tunnel $message") },
+                        beforeStartSession = { if (wirelessNetworkRecovery) validateNetwork?.invoke() },
+                        beforeWifiConfiguration = { if (wirelessNetworkRecovery) validateNetwork?.invoke() },
                     )
                     if (closed || generation != wirelessGeneration.get()) return@execute
                     when (result.terminal) {
@@ -2396,6 +2458,7 @@ class CarPlayController(
             WirelessHotspotMode.EXISTING_WIFI -> ExistingWifiManager(
                 appContext, config.existingWifiSsid, config.existingWifiPassphrase, ::debugLog,
                 onNetworkChanged = { if (!isStaleWirelessRun(generation)) restartWireless() },
+                validateRadio = wirelessNetworkRecovery,
             )
             WirelessHotspotMode.MANUAL -> ManualHotspotManager(
                 context = appContext,
@@ -2407,6 +2470,7 @@ class CarPlayController(
                 security = config.manualHotspotSecurity,
                 onDiagnostic = { debugLog("generation=$generation $it") },
                 isCancelled = { isStaleWirelessRun(generation) },
+                validateRadio = wirelessNetworkRecovery,
             )
         }
         synchronized(wirelessResourceLock) {
@@ -2638,6 +2702,7 @@ class CarPlayController(
             if (generation != null && generation != wirelessGeneration.get()) return@synchronized
             val owner = firstTcpWatchdog?.listener
             firstTcpWatchdog?.terminate()
+            wirelessNetworkValidation = null
             val diagnostics = wirelessDiagnostics
             wirelessDiagnostics = null
             diagnostics?.close()

@@ -24,6 +24,7 @@ class ExistingWifiManager(
     private val passphrase: String,
     private val onDiagnostic: (String) -> Unit = {},
     private val onNetworkChanged: () -> Unit = {},
+    private val validateRadio: Boolean = false,
 ) : WirelessHotspotManager {
     private val connectivity = context.applicationContext.getSystemService(ConnectivityManager::class.java)
         ?: throw IllegalStateException("ConnectivityManager is unavailable")
@@ -38,6 +39,7 @@ class ExistingWifiManager(
     private var interfaceIndex = 0
     @Volatile private var interfaceName: String? = null
     private var callbackRegistered = false
+    private var radioSnapshot: HotspotRadioSnapshot? = null
 
     private val callback = object : ConnectivityManager.NetworkCallback() {
         override fun onLost(network: Network) {
@@ -95,6 +97,7 @@ class ExistingWifiManager(
                 val frequency = info?.frequency?.takeIf { it > 0 }
                 val channel = frequency?.let(::wifiFrequencyMhzToChannel) ?: 0
                 val apBssid = accessPointAddress(info?.bssid)
+                if (validateRadio) radioSnapshot = HotspotRadioSnapshot(liveSsid, null, channel, info?.bssid)
                 val observedSecurity = if (Build.VERSION.SDK_INT >= 31 && info != null) info.currentSecurityType else -1
                 if (Build.VERSION.SDK_INT >= 31) {
                     when (observedSecurity) {
@@ -143,6 +146,23 @@ class ExistingWifiManager(
             Thread.sleep(200)
         }
         throw IOException("Existing Wi-Fi attachment was cancelled")
+    }
+
+    override fun validateReady() {
+        if (!validateRadio) return
+        val network = selected
+        val properties = network?.let(connectivity::getLinkProperties)
+        if (closed || invalidated.get() || properties == null || !sameLink(properties)) {
+            throw WirelessStartupException(WirelessStartupFailure.HOTSPOT_NOT_READY, "Existing Wi-Fi interface or address changed")
+        }
+        if (validateRadio && network != null) {
+            val info = if (Build.VERSION.SDK_INT >= 31)
+                connectivity.getNetworkCapabilities(network)?.transportInfo as? WifiInfo else wifi.connectionInfo
+            val current = HotspotRadioSnapshot(readableSsid(info), null,
+                info?.frequency?.takeIf { it > 0 }?.let(::wifiFrequencyMhzToChannel) ?: 0, info?.bssid)
+            if (radioSnapshot?.changed(current) == true) throw WirelessStartupException(
+                WirelessStartupFailure.HOTSPOT_NOT_READY, "Existing Wi-Fi radio changed; rebuilding wireless CarPlay")
+        }
     }
 
     private fun sameLink(properties: LinkProperties): Boolean =

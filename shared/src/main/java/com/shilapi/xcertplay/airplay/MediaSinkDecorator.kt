@@ -9,6 +9,14 @@ fun interface SessionControl {
     fun sendTouch(contacts: List<AirPlayContact>): Boolean
     /** Queues a switch to a declared area; false when unavailable. */
     fun showViewArea(index: Int): Boolean = false
+    /**
+     * Sends one CarPlay media HID press, with the index taken from [CarPlayMediaButton];
+     * false when no session accepts it.
+     *
+     * A head unit's steering-wheel or console keys reach the host as key events and have to
+     * travel through this channel to the phone instead of the head unit's own player.
+     */
+    fun sendMediaButton(index: Int): Boolean = false
 }
 
 /** Called once per session before its media engine starts; returning the supplied sink is valid. */

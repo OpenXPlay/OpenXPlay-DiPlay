@@ -11,6 +11,8 @@ internal class FirstTcpWatchdog(
     private val nowNanos: () -> Long = System::nanoTime,
     private val timeoutMillis: Long = WirelessStartupPolicy.FIRST_TCP_MILLIS,
     private val log: (String) -> Unit = {},
+    private val sessionTimeoutMillis: Long? = null,
+    private val onSessionTimeout: () -> Unit = onTimeout,
 ) {
     @Volatile var terminated = false
         private set
@@ -33,8 +35,9 @@ internal class FirstTcpWatchdog(
         if (firstAcceptNanos == null) {
             firstAcceptNanos = event.acceptedAtNanos
             log("first TCP atNs=${event.acceptedAtNanos}")
+            cancel()
+            if (!success && sessionTimeoutMillis != null) cancelTimer = schedule(sessionTimeoutMillis, ::expireSession)
         }
-        cancel()
         return true
     }
 
@@ -64,4 +67,14 @@ internal class FirstTcpWatchdog(
     }
 
     private fun cancel() { cancelTimer?.invoke(); cancelTimer = null }
+
+    private fun expireSession() {
+        synchronized(this) {
+            if (terminated || success || firstAcceptNanos == null) return
+            terminated = true
+            cancelTimer = null
+            log("session timeout after first TCP atNs=${nowNanos()}")
+        }
+        onSessionTimeout()
+    }
 }

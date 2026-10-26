@@ -33,6 +33,7 @@ class Iap2WirelessControlClient(
         // Evaluated only in the authenticated control loop when its original deadline expires.
         // The caller must prove that the current CarPlay session is usable before keeping it alive.
         keepAliveAfterDeadline: () -> Boolean = { false },
+        beforeWifiConfiguration: () -> Unit = {},
         onProgress: (String) -> Unit = {},
     ): Iap2WirelessControlResult {
         require(identification.wireless != null) {
@@ -142,6 +143,7 @@ class Iap2WirelessControlClient(
                                 "iap2 0x5703 ignored: maximum Wi-Fi configuration sends reached",
                             )
                         } else {
+                            beforeWifiConfiguration()
                             sendControl(accessoryWiFiConfiguration(endpoint))
                             stage = later(
                                 stage,
@@ -196,6 +198,7 @@ class Iap2WirelessControlClient(
                                     "maximum Wi-Fi configuration sends reached",
                             )
                         } else {
+                            beforeWifiConfiguration()
                             sendControl(accessoryWiFiConfiguration(endpoint))
                             stage = later(
                                 stage,

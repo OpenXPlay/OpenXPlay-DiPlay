@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-License-Identifier: GPL-3.0-only
+// Created by riko chen on 2026-10-27
 package com.shilapi.xcertplay.orchestration
 
 import android.Manifest
@@ -185,6 +188,8 @@ class CarPlayController(
     private val appContext = context.applicationContext
     private val wirelessNetworkRecovery =
         (appContext as? WirelessConnectionPolicyProvider)?.wirelessNetworkRecoveryEnabled == true
+    private val startupDiagnosticsEnabled = (appContext as? WirelessConnectionPolicyProvider)?.startupDiagnosticsEnabled == true
+    private val observationBackoff = (appContext as? WirelessConnectionPolicyProvider)?.networkObservationBackoffEnabled == true
     private val diagnosticAttempt = diagnosticAttempts.incrementAndGet()
     private val diagnosticRun = AtomicInteger()
     private val usbManager: UsbManager? = context.getSystemService(UsbManager::class.java)
@@ -328,6 +333,11 @@ class CarPlayController(
     }
 
     private val sessionListener = object : AirPlaySessionListener {
+        override fun onStartupMilestone(session: AirPlaySession, name: String) {
+            if (closed || !startupDiagnosticsEnabled) return
+            wirelessDiagnostics?.milestone(name)
+            notifyObserver { onStartupMilestone(name) }
+        }
         override fun onCornerMask(session: AirPlaySession, png: ByteArray, displayWidth: Int) {
             if (closed || session.isClosed) return
             if (activeSession != null && activeSession !== session) return
@@ -476,6 +486,13 @@ class CarPlayController(
         val session = activeSession ?: return null
         val token = session.mainScreenSessionToken() ?: return null
         return token.takeIf { !closed && activeSession === session && session.mainScreenSessionToken() === token }
+    }
+
+    fun reportExternalVideoFrameRendered(token: Any): Boolean {
+        val session = activeSession ?: return false
+        if (closed || session.isClosed || session.mainScreenSessionToken() !== token) return false
+        session.videoFrameRendered()
+        return !closed && activeSession === session && session.mainScreenSessionToken() === token
     }
 
     fun hasActiveAirPlayAttachment(): Boolean = synchronized(lifecycleLock) {
@@ -1359,7 +1376,7 @@ class CarPlayController(
                     "frequency=${hotspotInfo.frequencyMHz?.toString() ?: "unknown"}MHz",
             )
             var startedBonjour: CarPlayBonjour? = null
-            val receiveDiagnostics = WirelessReceiveDiagnostics(hotspotInfo.interfaceName)
+            val receiveDiagnostics = WirelessReceiveDiagnostics(hotspotInfo.interfaceName, suppressUnavailable = observationBackoff)
             val diagnostics = WirelessStartupDiagnostics(
                 sample = {
                     "${WirelessInterfaceDiagnostics.snapshot(hotspotInfo.interfaceName)} " +
@@ -1368,6 +1385,7 @@ class CarPlayController(
                         receiveDiagnostics.snapshot()
                 },
                 log = { message -> if (!isStaleWirelessRun(generation)) debugLog(message) },
+                followMedia = startupDiagnosticsEnabled,
             )
             wirelessDiagnostics = diagnostics
             onStatus(
@@ -1755,6 +1773,9 @@ class CarPlayController(
     private fun wirelessSessionListener(generation: Int, watchdog: FirstTcpWatchdog): AirPlaySessionListener =
         object : AirPlaySessionListener by sessionListener {
             private var reportedFrameSession: AirPlaySession? = null
+            override fun onStartupMilestone(session: AirPlaySession, name: String) {
+                if (!isStaleWirelessRun(generation)) sessionListener.onStartupMilestone(session, name)
+            }
 
             override fun onTcpAccepted(event: AirPlayTcpAccepted) {
                 if (isStaleWirelessRun(generation)) return
@@ -1771,7 +1792,7 @@ class CarPlayController(
                 if (isStaleWirelessRun(generation) || !watchdog.sessionEstablished()) return
                 wirelessDiagnostics?.let {
                     it.sessionActive()
-                    it.close()
+                    if (!startupDiagnosticsEnabled) it.close()
                 }
                 wirelessConnectionProof.activate(generation, session)
                 // Keep wirelessActiveReported false until maybeCompleteWirelessHandoff() closes
@@ -1789,6 +1810,7 @@ class CarPlayController(
                 if (isStaleWirelessRun(generation) || activeSession !== session) return
                 if (!watchdog.sessionEstablished()) return
                 wirelessConnectionProof.rendered(generation, session)
+                if (startupDiagnosticsEnabled) wirelessDiagnostics?.let { it.milestone("first_video_rendered"); it.close() }
                 val firstFrame = synchronized(this) {
                     if (reportedFrameSession === session) false else {
                         reportedFrameSession = session
@@ -2471,6 +2493,7 @@ class CarPlayController(
                 onDiagnostic = { debugLog("generation=$generation $it") },
                 isCancelled = { isStaleWirelessRun(generation) },
                 validateRadio = wirelessNetworkRecovery,
+                observationBackoff = observationBackoff,
             )
         }
         synchronized(wirelessResourceLock) {

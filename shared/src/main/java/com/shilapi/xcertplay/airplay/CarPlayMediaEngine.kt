@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-License-Identifier: GPL-3.0-only
+// Created by riko chen on 2026-10-27
 package com.shilapi.xcertplay.airplay
 
 import android.util.Log
@@ -47,12 +50,17 @@ interface MediaSink {
  * past it can still hand over one item; the successor's configuration and keyframe follow it. The iPhone
  * connects after SETUP returns the port, which is after the stream is registered as current.
  */
-internal fun currentScreenListener(type: Int, sink: MediaSink, isCurrent: () -> Boolean) = object : ScreenStream.Listener {
+internal fun currentScreenListener(type: Int, sink: MediaSink, isCurrent: () -> Boolean): ScreenStream.Listener =
+    currentScreenListener(type, sink, {}, isCurrent)
+
+internal fun currentScreenListener(type: Int, sink: MediaSink, firstFrame: () -> Unit, isCurrent: () -> Boolean) = object : ScreenStream.Listener {
+    private val received = java.util.concurrent.atomic.AtomicBoolean()
+    private fun received() { if (received.compareAndSet(false, true)) firstFrame() }
     override fun onCodec(codec: VideoCodec) { if (isCurrent()) sink.onVideoCodec(type, codec) }
     override fun onConfig(codecData: ByteArray) { if (isCurrent()) sink.onVideoConfig(type, codecData) }
-    override fun onFrame(naluBytes: ByteArray) { if (isCurrent()) sink.onVideoFrame(type, naluBytes) }
+    override fun onFrame(naluBytes: ByteArray) { if (isCurrent()) { received(); sink.onVideoFrame(type, naluBytes) } }
     override fun onFrame(naluBytes: ByteArray, senderNanos: Long, arrivalNanos: Long) {
-        if (isCurrent()) sink.onVideoFrame(type, naluBytes, senderNanos, arrivalNanos)
+        if (isCurrent()) { received(); sink.onVideoFrame(type, naluBytes, senderNanos, arrivalNanos) }
     }
 }
 
@@ -147,7 +155,7 @@ class CarPlayMediaEngine(
             }
         }
         val port = screen.listen(
-            object : ScreenStream.Listener by currentScreenListener(type, sink, isCurrent = { streams[streamKey] === screen }) {
+            object : ScreenStream.Listener by currentScreenListener(type, sink, firstFrame = { session.startupMilestone("first_video_received") }, isCurrent = { streams[streamKey] === screen }) {
                 override fun onClosed(cause: Throwable?) {
                     Log.w(
                         TAG,

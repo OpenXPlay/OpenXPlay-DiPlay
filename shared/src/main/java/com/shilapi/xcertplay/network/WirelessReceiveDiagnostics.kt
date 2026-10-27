@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-License-Identifier: GPL-3.0-only
+// Created by riko chen on 2026-10-27
 package com.shilapi.xcertplay.network
 
 import java.io.File
@@ -12,6 +15,7 @@ internal class WirelessReceiveDiagnostics(
     interfaceName: String?,
     private val read: (String, Int) -> String = ::readBoundedDiagnosticFile,
     private val nowNs: () -> Long = System::nanoTime,
+    private val suppressUnavailable: Boolean = false,
 ) {
     private val interfaceSource = CounterSource("ifaceRx") {
         if (interfaceName == null || !INTERFACE_NAME.matches(interfaceName)) throw IOException()
@@ -35,14 +39,16 @@ internal class WirelessReceiveDiagnostics(
         previousSampleNs = now
         val prefix = "receiveCounters windowMs=${elapsed ?: "baseline"} udpScope=device "
         // Keep every source on its own short exported line, including full-width Long deltas.
-        return listOf(interfaceSource, udp4Source, udp6Source).joinToString("\n") {
-            prefix + it.snapshot()
-        }
+        return listOf(interfaceSource, udp4Source, udp6Source).mapNotNull { source ->
+            if (suppressUnavailable && source.isUnavailable) null else prefix + source.snapshot()
+        }.joinToString("\n")
     }
 
     private class CounterSource(private val label: String, private val sample: () -> Map<String, Long>) {
         private var previous: Map<String, Long>? = null
         private var unavailable: String? = null
+
+        val isUnavailable: Boolean get() = unavailable != null
 
         fun snapshot(): String {
             unavailable?.let { return "$label=unavailable failureClass=$it" }

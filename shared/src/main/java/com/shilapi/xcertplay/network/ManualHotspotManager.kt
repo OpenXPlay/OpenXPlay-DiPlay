@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-License-Identifier: GPL-3.0-only
+// Created by riko chen on 2026-10-27
 package com.shilapi.xcertplay.network
 
 import android.annotation.SuppressLint
@@ -34,9 +37,13 @@ class ManualHotspotManager(
     private val onDiagnostic: (String) -> Unit = {},
     private val isCancelled: () -> Boolean = { false },
     private val validateRadio: Boolean = false,
+    private val observationBackoff: Boolean = false,
 ) : WirelessHotspotManager {
     private val appContext = context.applicationContext
     private val interfaces = ManualHotspotInterfaces(appContext, onDiagnostic)
+    private val hardwareAddresses = HardwareAddressObservations(observationBackoff,
+        read = { name -> runCatching { NetworkInterface.getByName(name)?.hardwareAddress?.toMacAddressString() }.getOrNull() },
+        unavailable = { onDiagnostic("hardwareAddress=unavailable observation=backoff") })
     private val waitLock = Object()
     private var confirmed: HotspotSelection? = null
     private var radioSnapshot: HotspotRadioSnapshot? = null
@@ -109,7 +116,7 @@ class ManualHotspotManager(
         onDiagnostic("hotspot interface confirmed iface=${selected.name} index=${selected.index} atNs=${System.nanoTime()}")
         val network = NetworkInterface.getByName(selected.name)
         val localInterface = LocalHotspotInterface(selected.name, selected.address,
-            runCatching { network?.hardwareAddress?.toMacAddressString() }.getOrNull()
+            hardwareAddresses.read(selected.name)
                 ?.takeUnless { it == "02:00:00:00:00:00" || it == "00:00:00:00:00:00" }
                 ?: HotspotInterfaceBssid.read(selected.name))
         val connectionFrequency = if (companion) null else frequencyFromConnectionInfo()
@@ -185,8 +192,7 @@ class ManualHotspotManager(
             val read = readApConfiguration()
             val companion = read != null && isFiveGhzCompanion(read.ssid, expectedSsid)
             val configuration = read.takeUnless { companion }
-            val iface = NetworkInterface.getByName(current.name)
-            val bssid = runCatching { iface?.hardwareAddress?.toMacAddressString() }.getOrNull()
+            val bssid = hardwareAddresses.read(current.name)
                 ?: HotspotInterfaceBssid.read(current.name)
             val local = LocalHotspotInterface(current.name, current.address, bssid)
             val channel = observedManualHotspotChannel(configuration?.channel ?: 0,
@@ -421,4 +427,16 @@ private fun ManualHotspotSecurity.toIap2Security(): Iap2WirelessSecurity = when 
     ManualHotspotSecurity.WPA2 -> Iap2WirelessSecurity.WPA_WPA2
     ManualHotspotSecurity.WPA3_TRANSITION -> Iap2WirelessSecurity.WPA3_TRANSITION
     ManualHotspotSecurity.WPA3 -> Iap2WirelessSecurity.WPA3_ONLY
+}
+
+/** Capability failures are remembered per interface and manager attempt; readable sources stay live. */
+internal class HardwareAddressObservations(private val backoff: Boolean, private val read: (String) -> String?,
+    private val unavailable: () -> Unit = {}) {
+    private val unsupported = mutableSetOf<String>()
+    @Synchronized fun read(name: String): String? {
+        if (backoff && name in unsupported) return null
+        val value = read.invoke(name)
+        if (value == null && backoff && unsupported.add(name)) unavailable()
+        return value
+    }
 }

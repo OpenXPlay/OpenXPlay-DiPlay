@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-License-Identifier: GPL-3.0-only
+// Created by riko chen on 2026-10-27
 package com.shilapi.xcertplay.network
 
 import java.io.File
@@ -6,6 +9,14 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class WirelessReceiveDiagnosticsTest {
+    @Test fun backoffReportsUnsupportedSourcesOncePerAttempt() {
+        var reads = 0
+        val diagnostics = WirelessReceiveDiagnostics("p2p0", { _, _ -> reads++; throw IOException("secret") }, suppressUnavailable = true)
+        assertEquals(3, diagnostics.snapshot().lines().size)
+        repeat(10) { assertEquals("", diagnostics.snapshot()) }
+        assertEquals(3, reads)
+    }
+
     @Test fun fullWidthCounterDeltasFitOnSeparateExportableLines() {
         var value = 0L
         var clock = 0L

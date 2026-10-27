@@ -8,6 +8,10 @@ fun interface SessionControl {
     /** Returns false when no session accepts the input. Coordinates are normalized to [0, 1]. */
     fun sendTouch(contacts: List<AirPlayContact>): Boolean
     /** Queues a switch to a declared area; false when unavailable. */
+    /** Opaque identity for the currently accepted main stream. Never cache across streams. */
+    fun playbackToken(): Any? = null
+    /** Reports a frame actually displayed by an external receiver; stale tokens are rejected. */
+    fun reportVideoFrameRendered(token: Any): Boolean = false
     fun showViewArea(index: Int): Boolean = false
     /**
      * Sends one CarPlay media HID press, with the index taken from [CarPlayMediaButton];

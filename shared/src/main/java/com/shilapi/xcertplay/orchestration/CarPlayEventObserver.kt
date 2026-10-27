@@ -19,6 +19,9 @@ interface CarPlayEventObserver {
      */
     fun onProgress(message: String) {}
 
+    /** Safe, fixed protocol milestones, never pairing payloads or credentials. */
+    fun onStartupMilestone(name: String) {}
+
     /** A CarPlay session started recording; may repeat for the same session. */
     fun onSessionActive() {}
 

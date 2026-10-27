@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-License-Identifier: GPL-3.0-only
+// Created by riko chen on 2026-10-27
 package com.shilapi.xcertplay
 
 import android.os.Handler
@@ -51,6 +54,22 @@ class WirelessStartupRecoveryTest {
             from(Int::class.javaPrimitiveType, generation))(status)
     }
     private fun budget() = ReflectionHelpers.getField<WirelessStartupRetryBudget>(activity, "startupRetryBudget")
+
+    @Test fun recoveredControlCancelsQueuedRetryButAnotherLossKeepsItEligible() {
+        val log = java.io.File.createTempFile("retry-recovered", ".log")
+        ReflectionHelpers.setField(activity, "sessionLog", SessionLogFile(log))
+        report()
+        report(status = CarPlayStatus.RunningWireless)
+        assertEquals(1L, ReflectionHelpers.getField<Long>(activity, "controlRunningCount"))
+        assertFalse(ReflectionHelpers.getField(activity, "lossSinceControlRunning"))
+        org.robolectric.Shadows.shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(35))
+        assertFalse(ReflectionHelpers.getField(activity, "reconnectScheduled"))
+        assertEquals(0, ReflectionHelpers.getField<Int>(activity, "restartGeneration"))
+        assertTrue(log.readText().contains("cancelling queued retry"))
+        log.delete()
+        report(status = CarPlayStatus.ControlEnded)
+        assertTrue(ReflectionHelpers.getField(activity, "lossSinceControlRunning"))
+    }
 
     @Test fun duplicateFailureAndCleanupErrorScheduleOnlyOneRetry() {
         report()

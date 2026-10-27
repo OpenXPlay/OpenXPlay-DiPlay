@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-License-Identifier: GPL-3.0-only
+// Created by riko chen on 2026-10-27
 package com.shilapi.xcertplay.airplay
 
 import android.util.Log
@@ -25,6 +28,7 @@ data class AirPlayDeviceInfo(
 
 /** Session lifecycle and command callbacks for the driver/UI layer. */
 interface AirPlaySessionListener {
+    fun onStartupMilestone(session: AirPlaySession, name: String) {}
     fun onTcpAccepted(event: AirPlayTcpAccepted) {}
     fun onSessionActive(session: AirPlaySession) {}
     fun onSessionEnded(session: AirPlaySession) {}
@@ -125,6 +129,10 @@ class AirPlaySession(
     fun syncedNtp(): BigInteger = ntp.syncedNtp()
 
     internal fun logDebug(message: String) = debugLog(message)
+
+    internal fun startupMilestone(name: String) {
+        runCatching { listener.onStartupMilestone(this, name) }
+    }
 
     internal fun videoFrameRendered() {
         if (!closed.get()) listener.onVideoFrameRendered(this)
@@ -507,6 +515,7 @@ class AirPlaySession(
                     if (cipher == null && pairVerify.controlKeys != null) {
                         val keys = pairVerify.controlKeys!!
                         cipher = ControlCipher(keys.readKey, keys.writeKey)
+                        startupMilestone("pair_verified")
                         debugLog("airplay control encryption enabled")
                     }
                 }
@@ -517,6 +526,12 @@ class AirPlaySession(
             closeReason = "control I/O failed: ${error.message ?: error.javaClass.simpleName}"
             if (!closed.get()) Log.e(TAG, "airplay $closeReason", error)
         } finally {
+            startupMilestone(when {
+                closed.get() -> "transport_closed_local"
+                closeReason == "peer EOF" -> "transport_closed_peer_eof"
+                closeReason.startsWith("control decrypt failed") -> "transport_closed_decrypt_failed"
+                else -> "transport_closed_io_failed"
+            })
             debugLog("airplay control closing reason=$closeReason activeStreams=$activeStreams")
             close()
         }
@@ -566,6 +581,7 @@ class AirPlaySession(
             )
             path.endsWith("/auth-setup") -> {
                 val body = mfi?.let { MfiSapAuthSetup.handle(request.body, it) }
+                if (body != null) startupMilestone("auth_setup_accepted")
                 if (body == null) RtspMessage.Response(status = 400)
                 else RtspMessage.Response(headers = mapOf("Content-Type" to OCTET_CONTENT_TYPE), body = body)
             }
@@ -655,6 +671,7 @@ class AirPlaySession(
             return RtspMessage.Response(headers = mapOf("Content-Type" to PLIST_CONTENT_TYPE), body = body)
         }
 
+        startupMilestone("setup_control")
         val name = string(dict["name"])
         val deviceId = string(dict["deviceID"])
         val wifiMac = string(dict["macAddress"]).lowercase()
@@ -698,6 +715,7 @@ class AirPlaySession(
                         if (type == STREAM_TYPE_MAIN_SCREEN && config.main.useIphoneCornerMask) {
                             findIphoneCornerMask(stream)?.let(::notifyCornerMask)
                         }
+                        startupMilestone(if (type == STREAM_TYPE_MAIN_SCREEN) "setup_main_screen" else "setup_cluster_screen")
                         activeStreams.add(type)
                         if (type == STREAM_TYPE_ALT_SCREEN) beginClusterContent()
                         else mainScreenToken = Any()

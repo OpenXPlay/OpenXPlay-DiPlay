@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-License-Identifier: GPL-3.0-only
+// Created by riko chen on 2026-10-27
 package com.shilapi.xcertplay.network
 
 import java.io.Closeable
@@ -14,6 +17,7 @@ internal class WirelessStartupDiagnostics(
     private val log: (String) -> Unit,
     private val intervalMillis: Long = 10_000,
     private val nowNs: () -> Long = System::nanoTime,
+    private val followMedia: Boolean = false,
 ) : Closeable {
     private val closed = AtomicBoolean(false)
     private val startedNanos = nowNs()
@@ -22,6 +26,7 @@ internal class WirelessStartupDiagnostics(
     private var startRequests = 0
     private var tcpAccepted = 0
     private var sessionActive = false
+    private val milestones = linkedSetOf<String>()
     private var firstStartRequestNs: Long? = null
     private var firstTcpAfterStartMs: Long? = null
     @Volatile private var lastSnapshot = ""
@@ -51,10 +56,15 @@ internal class WirelessStartupDiagnostics(
             firstStartRequestNs?.let { firstTcpAfterStartMs = elapsedMillis(it) }
         }
     }
+    @Synchronized fun milestone(name: String) {
+        if (closed.get() || !milestones.add(name)) return
+        emit("wireless milestone=$name elapsedMs=${elapsedMillis(startedNanos)}")
+    }
     @Synchronized fun sessionActive() { sessionActive = true }
 
     @Synchronized fun summary(): String {
         val waitingFor = when {
+            sessionActive && followMedia && "first_video_rendered" !in milestones -> "media_setup_or_first_picture"
             sessionActive -> "none"
             tcpAccepted > 0 -> "AirPlay_protocol"
             startRequests > 0 -> "WiFi_discovery_or_AirPlay_TCP"
@@ -80,6 +90,7 @@ internal class WirelessStartupDiagnostics(
                 lastSnapshot = snapshot
                 emit(summary())
                 emitSnapshot(snapshot)
+                if (followMedia && elapsedMillis(startedNanos) >= 120_000) { close(); return }
                 Thread.sleep(intervalMillis)
             }
         } catch (_: InterruptedException) {

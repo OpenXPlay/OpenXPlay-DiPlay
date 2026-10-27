@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-License-Identifier: GPL-3.0-only
+// Created by riko chen on 2026-10-27
 package com.shilapi.xcertplay
 
 import android.content.Context
@@ -129,6 +132,22 @@ class WheelJoystickSessionTest {
         shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(300))
         assertEquals("Replacing the active phone must restore the keys even when the controller is reused",
             false to false, press(KeyEvent.KEYCODE_F5))
+    }
+
+    @Test fun externalPlaybackConfirmationRejectsReplacedStreamsPhonesAndClosedControllers() {
+        val phone = newPhone()
+        attachPhone(phone)
+        val first = requireNotNull(controller.activeAirPlaySessionToken())
+        assertTrue(controller.reportExternalVideoFrameRendered(first))
+        setup(phone, 110L)
+        assertFalse(controller.reportExternalVideoFrameRendered(first))
+        val second = requireNotNull(controller.activeAirPlaySessionToken())
+        assertTrue(controller.reportExternalVideoFrameRendered(second))
+        attachPhone(newPhone())
+        assertFalse(controller.reportExternalVideoFrameRendered(second))
+        val current = requireNotNull(controller.activeAirPlaySessionToken())
+        controller.close()
+        assertFalse(controller.reportExternalVideoFrameRendered(current))
     }
 
     @Test fun aRecordedPhoneWithoutAMainScreenDoesNotOwnTheWheel() {

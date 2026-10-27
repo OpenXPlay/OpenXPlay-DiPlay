@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-License-Identifier: GPL-3.0-only
+// Created by riko chen on 2026-10-27
 package com.shilapi.xcertplay
 
 import android.app.AlertDialog
@@ -592,6 +595,10 @@ class CarPlayHostActivity : ComponentActivity() {
     private var startAfterHandshakeReset = false
     private var restartGeneration = 0
     private var reconnectScheduled = false
+    private var controlRunningCount = 0L
+    private var lossSinceControlRunning = false
+    private val cancelRecoveredRetries: Boolean get() =
+        (application as? com.shilapi.xcertplay.orchestration.WirelessConnectionPolicyProvider)?.cancelRecoveredRetries ?: true
     private var requestedSmallWindowForStream: Boolean? = null
     @Volatile private var adbNaviMode: com.shilapi.xcertplay.hud.BydClusterNaviMode? = null
     private var sessionLog: SessionLogFile? = null
@@ -5190,17 +5197,23 @@ class CarPlayHostActivity : ComponentActivity() {
         )
     }
 
-    private fun createMediaEngine(sink: AndroidMediaSink): CarPlayMediaEngine =
-        CarPlayMediaEngine(
+    private fun createMediaEngine(sink: AndroidMediaSink): CarPlayMediaEngine {
+        val generation = restartGeneration
+        return CarPlayMediaEngine(
             sink = (application as? MediaSinkDecoratorProvider)?.mediaSinkDecorator
                 ?.decorate(sink, object : SessionControl {
                     override fun sendTouch(contacts: List<com.shilapi.xcertplay.airplay.AirPlayContact>) = controller?.sendTouch(contacts) ?: false
                     override fun showViewArea(index: Int) = controller?.showViewArea(index) ?: false
                     override fun sendMediaButton(index: Int) = controller?.sendMediaButton(index) ?: false
+                    override fun playbackToken(): Any? =
+                        if (generation == restartGeneration) controller?.activeAirPlaySessionToken() else null
+                    override fun reportVideoFrameRendered(token: Any): Boolean =
+                        generation == restartGeneration && controller?.reportExternalVideoFrameRendered(token) == true
                 }) ?: sink,
             microphoneEnabled = microphoneAvailable,
             audioCaptureDirectory = audioCaptureDirectory(),
         )
+    }
 
     private fun createSessionListener(controllerGeneration: Int): AirPlaySessionListener =
         object : AirPlaySessionListener {
@@ -5330,6 +5343,14 @@ class CarPlayHostActivity : ComponentActivity() {
         controllerGeneration: Int,
     ): (CarPlayStatus) -> Unit = report@{ status ->
         if (controllerGeneration != restartGeneration) return@report
+        when (status) {
+            is CarPlayStatus.RunningControl, is CarPlayStatus.RunningWireless -> {
+                controlRunningCount++
+                lossSinceControlRunning = false
+            }
+            is CarPlayStatus.Failed, is CarPlayStatus.ControlEnded -> lossSinceControlRunning = true
+            else -> Unit
+        }
         if (status is CarPlayStatus.Failed || status is CarPlayStatus.ControlEnded) {
             callPopupSessionReady = false
             updateCallPopupGuard()
@@ -5882,6 +5903,7 @@ class CarPlayHostActivity : ComponentActivity() {
         if (!CarPlayBackgroundSession.isOwner(this)) return
         if (menuOpen) recoveryPendingAfterMenu = true
         if (shuttingDown.get() || menuOpen || handshakeResetInProgress || startupRetryStopped) return
+        lossSinceControlRunning = true
         if (reconnectScheduled) return
         val startupDelay = if (startupFailure != null && startupFailure.retryable)
             startupRetryBudget.nextDelayMillis() else null
@@ -5905,6 +5927,7 @@ class CarPlayHostActivity : ComponentActivity() {
         callPopupSessionReady = false
         updateCallPopupGuard()
         val generation = restartGeneration
+        val runningAtSchedule = controlRunningCount
         val delayMillis = if (startupDelay != null) {
             startupDelay
         } else if (reason.contains("AirPlay iAP tunnel", ignoreCase = true)) {
@@ -5924,6 +5947,10 @@ class CarPlayHostActivity : ComponentActivity() {
                     handshakeResetInProgress || startupRetryStopped ||
                     generation != restartGeneration
                 ) {
+                    return@postDelayed
+                }
+                if (cancelRecoveredRetries && controlRunningCount != runningAtSchedule && !lossSinceControlRunning) {
+                    appendLog("Connection recovered; cancelling queued retry generation=$generation")
                     return@postDelayed
                 }
                 restartCarPlay("Reconnecting after $reason")

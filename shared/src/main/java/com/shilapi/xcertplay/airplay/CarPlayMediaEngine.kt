@@ -181,10 +181,13 @@ class CarPlayMediaEngine(
                     previous?.let { old ->
                         if (old.key.session !== session) {
                             retiredScreens.getOrPut(old.key.session) { mutableSetOf() }.add(type)
+                            // A new control session also needs fresh relay playback confirmation.
+                            removeScreen(old)
+                        } else {
+                            // Reconfiguring one screen must preserve this session's audio and control.
+                            screenOwners.remove(type)
+                            streams.remove(old.key, old.stream)
                         }
-                        // End the old output before the new handlers or format can reach the sink.
-                        // Relay outputs also use this boundary to reset their session/playback proof.
-                        removeScreen(old)
                     }
                     // A sink callback can synchronously close this session or install another owner.
                     if (session.isClosed || retiredScreens[session]?.contains(type) == true || screenOwners[type] != null) {

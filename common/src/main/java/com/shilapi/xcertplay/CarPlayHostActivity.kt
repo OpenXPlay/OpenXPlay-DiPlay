@@ -5212,6 +5212,8 @@ class CarPlayHostActivity : ComponentActivity() {
                 }) ?: sink,
             microphoneEnabled = microphoneAvailable,
             audioCaptureDirectory = audioCaptureDirectory(),
+            screenSessionPolicy = (application as? com.shilapi.xcertplay.airplay.ScreenSessionPolicyProvider)
+                ?.screenSessionPolicy ?: com.shilapi.xcertplay.airplay.ScreenSessionPolicy(),
         )
     }
 

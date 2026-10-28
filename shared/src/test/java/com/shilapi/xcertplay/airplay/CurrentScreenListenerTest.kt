@@ -227,4 +227,40 @@ class CurrentScreenListenerTest {
         listener = object : AirPlaySessionListener {},
         media = object : AirPlayMediaHandler {},
     )
+
+    @Test fun disabledSerializationAllowsHandoffDuringAnInFlightFrame() {
+        val lock = Any()
+        val current = AtomicBoolean(true)
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val replaced = CountDownLatch(1)
+        val events = Collections.synchronizedList(mutableListOf<String>())
+        val listener = currentScreenListener(110, object : MediaSink {
+            override fun onVideoFrame(type: Int, naluBytes: ByteArray) {
+                events += "old-frame-start"
+                entered.countDown()
+                check(release.await(5, TimeUnit.SECONDS))
+                events += "old-frame-end"
+            }
+        }, {}, { current.get() }, null)
+        val delivery = Thread { listener.onFrame(frame) }
+        val replacement = Thread {
+            synchronized(lock) { current.set(false); events += "replacement" }
+            replaced.countDown()
+        }
+        try {
+            delivery.start()
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            replacement.start()
+            assertTrue(replaced.await(5, TimeUnit.SECONDS))
+            release.countDown()
+            delivery.join(5_000)
+            replacement.join(5_000)
+            assertEquals(listOf("old-frame-start", "replacement", "old-frame-end"), events.toList())
+        } finally {
+            release.countDown()
+            delivery.join(5_000)
+            replacement.join(5_000)
+        }
+    }
 }

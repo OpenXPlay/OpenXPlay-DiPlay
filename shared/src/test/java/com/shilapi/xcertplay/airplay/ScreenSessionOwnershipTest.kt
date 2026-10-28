@@ -5,6 +5,8 @@ package com.shilapi.xcertplay.airplay
 
 import java.io.Closeable
 import java.net.Socket
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -16,6 +18,7 @@ import org.robolectric.annotation.Config
 class ScreenSessionOwnershipTest {
     private class RecordingSink : MediaSink {
         val activeScreens = mutableMapOf<Int, Boolean>()
+        val states = mutableListOf<Boolean>()
         val active: Boolean get() = activeScreens[110] == true
         val recoveries = mutableMapOf<Int, () -> Unit>()
         val diagnostics = mutableMapOf<Int, (String) -> Unit>()
@@ -28,7 +31,7 @@ class ScreenSessionOwnershipTest {
             deliveries += "timed:$type:$senderNanos:$arrivalNanos"
         }
         val frames = mutableListOf<Int>()
-        override fun onScreenStreamActive(type: Int, active: Boolean) { activeScreens[type] = active }
+        override fun onScreenStreamActive(type: Int, active: Boolean) { activeScreens[type] = active; if (type == 110) states += active }
         override fun onVideoFrame(type: Int, naluBytes: ByteArray) { frames += naluBytes[0].toInt() }
     }
     private fun session(engine: CarPlayMediaEngine, observer: AirPlaySessionListener = object : AirPlaySessionListener {}) = AirPlaySession(
@@ -245,5 +248,106 @@ class ScreenSessionOwnershipTest {
             assertFalse(sink.active)
             assertTrue(sink.frames.isEmpty())
         } finally { peer.close() }
+    }
+
+    @Test fun allPolicyCombinationsHaveRealEnabledAndDisabledBehavior() {
+        for (bits in 0..7) {
+            val policy = ScreenSessionPolicy(bits and 1 != 0, bits and 2 != 0, bits and 4 != 0)
+            val sink = RecordingSink()
+            val engine = CarPlayMediaEngine(sink, screenSessionPolicy = policy)
+            val old = session(engine)
+            val fresh = session(engine)
+            try {
+                engine.onScreen(old, 110, mapOf("streamConnectionID" to 1L))
+                val previous = listener(engine, old)
+                engine.onScreen(fresh, 110, mapOf("streamConnectionID" to 2L))
+                previous.onFrame(byteArrayOf(1))
+                listener(engine, fresh).onFrame(byteArrayOf(2))
+                assertEquals(policy.toString(),
+                    if (policy.isolateSessions || policy.resetOnReconnect) listOf(2) else listOf(1, 2), sink.frames)
+                assertEquals(policy.toString(),
+                    if (policy.resetOnReconnect) listOf(true, false, true) else listOf(true, true), sink.states)
+                old.close()
+                assertEquals(policy.toString(), policy.isolateSessions || policy.resetOnReconnect, sink.active)
+                assertFalse(fresh.isClosed)
+            } finally { old.close(); fresh.close() }
+        }
+    }
+
+    @Test fun isolationOptionControlsRetiredSetupAndUnknownTeardown() {
+        for (isolate in listOf(false, true)) {
+            val sink = RecordingSink()
+            val engine = CarPlayMediaEngine(sink, screenSessionPolicy = ScreenSessionPolicy(isolateSessions = isolate))
+            val old = session(engine)
+            val fresh = session(engine)
+            try {
+                engine.onScreen(old, 110, mapOf("streamConnectionID" to 1L))
+                engine.onScreen(fresh, 110, mapOf("streamConnectionID" to 2L))
+                engine.onTeardown(old, 110)
+                assertEquals(isolate, sink.active)
+                val reclaimed = engine.onScreen(old, 110, mapOf("streamConnectionID" to 3L))
+                if (isolate) assertNull(reclaimed) else assertNotNull(reclaimed)
+            } finally { old.close(); fresh.close() }
+        }
+    }
+
+    @Test fun sameControlReconfigurationPreservesTheSessionUnderEveryPolicy() {
+        for (bits in 0..7) {
+            val policy = ScreenSessionPolicy(bits and 1 != 0, bits and 2 != 0, bits and 4 != 0)
+            val sink = RecordingSink()
+            val engine = CarPlayMediaEngine(sink, screenSessionPolicy = policy)
+            val peer = session(engine)
+            try {
+                engine.onScreen(peer, 110, mapOf("streamConnectionID" to 1L))
+                engine.onScreen(peer, 110, mapOf("streamConnectionID" to 2L))
+                assertEquals(policy.toString(), listOf(true, true), sink.states)
+            } finally { peer.close() }
+        }
+    }
+
+    @Test fun serializationPolicyControlsActualEngineHandoffDuringAFrame() {
+        for (serialize in listOf(false, true)) {
+            val entered = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            val replacing = CountDownLatch(1)
+            val replaced = CountDownLatch(1)
+            val engine = CarPlayMediaEngine(object : MediaSink {
+                override fun onVideoFrame(type: Int, naluBytes: ByteArray) {
+                    entered.countDown()
+                    check(release.await(5, TimeUnit.SECONDS))
+                }
+            }, screenSessionPolicy = ScreenSessionPolicy(serializeDelivery = serialize))
+            val old = session(engine)
+            val fresh = session(engine)
+            engine.onScreen(old, 110, mapOf("streamConnectionID" to 1L))
+            val previous = listener(engine, old)
+            val delivery = Thread { previous.onFrame(byteArrayOf(1)) }
+            val replacement = Thread {
+                replacing.countDown()
+                engine.onScreen(fresh, 110, mapOf("streamConnectionID" to 2L))
+                replaced.countDown()
+            }
+            try {
+                delivery.start()
+                assertTrue(entered.await(5, TimeUnit.SECONDS))
+                replacement.start()
+                assertTrue(replacing.await(5, TimeUnit.SECONDS))
+                if (serialize) {
+                    val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+                    while (replacement.state != Thread.State.BLOCKED && replaced.count > 0 && System.nanoTime() < deadline) Thread.yield()
+                    assertEquals(Thread.State.BLOCKED, replacement.state)
+                    assertEquals(1L, replaced.count)
+                } else assertTrue(replaced.await(5, TimeUnit.SECONDS))
+                release.countDown()
+                delivery.join(5_000)
+                replacement.join(5_000)
+                assertFalse(delivery.isAlive || replacement.isAlive)
+            } finally {
+                release.countDown()
+                delivery.join(5_000)
+                replacement.join(5_000)
+                old.close(); fresh.close()
+            }
+        }
     }
 }

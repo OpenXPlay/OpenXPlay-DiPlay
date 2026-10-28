@@ -45,17 +45,21 @@ interface MediaSink {
  * streams can additionally return a PCM microphone uplink through the sink.
  */
 /**
- * Checks ownership and delivers under the same lock as screen replacement and teardown. An old
- * stream cannot finish a delayed delivery after its successor has configured the shared sink.
+ * With serialization enabled, ownership checks and delivery share the replacement/teardown lock.
+ * The host can disable that behavior for comparison with the earlier check-then-deliver path.
  */
 internal fun currentScreenListener(type: Int, sink: MediaSink, isCurrent: () -> Boolean): ScreenStream.Listener =
     currentScreenListener(type, sink, {}, isCurrent)
 
 internal fun currentScreenListener(type: Int, sink: MediaSink, firstFrame: () -> Unit, isCurrent: () -> Boolean,
-    deliveryLock: Any = Any()) = object : ScreenStream.Listener {
+    deliveryLock: Any? = Any()) = object : ScreenStream.Listener {
     private val received = java.util.concurrent.atomic.AtomicBoolean()
     private fun received() { if (received.compareAndSet(false, true)) firstFrame() }
-    private fun deliver(action: () -> Unit) = synchronized(deliveryLock) { if (isCurrent()) action() }
+    private fun deliver(action: () -> Unit) {
+        if (deliveryLock == null) {
+            if (isCurrent()) action()
+        } else synchronized(deliveryLock) { if (isCurrent()) action() }
+    }
     override fun onCodec(codec: VideoCodec) = deliver { sink.onVideoCodec(type, codec) }
     override fun onConfig(codecData: ByteArray) = deliver { sink.onVideoConfig(type, codecData) }
     override fun onFrame(naluBytes: ByteArray) = deliver {
@@ -74,6 +78,7 @@ class CarPlayMediaEngine(
     private val sink: MediaSink,
     private val microphoneEnabled: Boolean = false,
     private val audioCaptureDirectory: File? = null,
+    private val screenSessionPolicy: ScreenSessionPolicy = ScreenSessionPolicy(),
 ) : AirPlayMediaHandler {
     internal data class StreamKey(
         val session: AirPlaySession,
@@ -101,6 +106,7 @@ class CarPlayMediaEngine(
     // Control connections overlap during reconnect, but the sink has one renderer per screen type.
     private val screenOwnershipLock = Any()
     private val screenOwners = mutableMapOf<Int, ScreenOutput>()
+    private val screenOutputs = mutableMapOf<StreamKey, ScreenOutput>()
     private val retiredScreens = WeakHashMap<AirPlaySession, MutableSet<Int>>()
     private class ScreenOutput(val key: StreamKey, val stream: ScreenStream) {
         var ended = false // guarded by screenOwnershipLock
@@ -155,7 +161,8 @@ class CarPlayMediaEngine(
         val port = screen.listen(
             object : ScreenStream.Listener by currentScreenListener(type, sink,
                 firstFrame = { session.startupMilestone("first_video_received") },
-                isCurrent = { ownsScreen(output) }, deliveryLock = screenOwnershipLock) {
+                isCurrent = { synchronized(screenOwnershipLock) { ownsScreen(output) } },
+                deliveryLock = screenOwnershipLock.takeIf { screenSessionPolicy.serializeDelivery }) {
                 override fun onClosed(cause: Throwable?) {
                     Log.w(
                         TAG,
@@ -163,37 +170,45 @@ class CarPlayMediaEngine(
                     )
                     val current = synchronized(screenOwnershipLock) {
                         output.ended = true
-                        if (screenOwners[type] !== output) false else {
+                        if (!registeredScreen(output)) false else {
                             retireScreenSession(session)
                             removeScreen(output)
                             true
                         }
                     }
-                    if (current) session.close()
+                    if (current || !screenSessionPolicy.isolateSessions) session.close()
                 }
             },
         )
         var previous: ScreenOutput? = null
         try {
             val installed = synchronized(screenOwnershipLock) {
-                if (session.isClosed || output.ended || retiredScreens[session]?.contains(type) == true) false else {
+                if (session.isClosed || output.ended || retiredScreen(session, type)) false else {
                     previous = screenOwners[type]
                     previous?.let { old ->
                         if (old.key.session !== session) {
-                            retiredScreens.getOrPut(old.key.session) { mutableSetOf() }.add(type)
-                            // A new control session also needs fresh relay playback confirmation.
-                            removeScreen(old)
+                            if (screenSessionPolicy.isolateSessions) {
+                                retiredScreens.getOrPut(old.key.session) { mutableSetOf() }.add(type)
+                            }
+                            if (screenSessionPolicy.resetOnReconnect) removeScreen(old)
+                            else if (screenSessionPolicy.isolateSessions) forgetScreen(old)
                         } else {
                             // Reconfiguring one screen must preserve this session's audio and control.
-                            screenOwners.remove(type)
-                            streams.remove(old.key, old.stream)
+                            forgetScreen(old)
                         }
                     }
                     // A sink callback can synchronously close this session or install another owner.
-                    if (session.isClosed || retiredScreens[session]?.contains(type) == true || screenOwners[type] != null) {
+                    if (session.isClosed || retiredScreen(session, type) ||
+                        screenOwners[type]?.let { it !== previous } == true) {
                         return@synchronized false
                     }
+                    // A non-isolated older session may already have another stream for this key.
+                    screenOutputs[streamKey]?.takeIf { it !== previous }?.let { old ->
+                        forgetScreen(old)
+                        old.stream.close()
+                    }
                     screenOwners[type] = output
+                    screenOutputs[streamKey] = output
                     streams[streamKey] = screen
                     sink.setVideoDiagnosticHandler(type) { message ->
                         // Do not hold the delivery lock while calling back into the controller.
@@ -223,19 +238,31 @@ class CarPlayMediaEngine(
             throw error
         } finally {
             // Closing a socket can wake callbacks; ownership has already changed before it does.
-            previous?.stream?.close()
+            previous?.takeIf { screenSessionPolicy.isolateSessions || screenSessionPolicy.resetOnReconnect || it.key == streamKey }
+                ?.stream?.close()
         }
     }
 
     /** Caller holds screenOwnershipLock. */
     private fun ownsScreen(output: ScreenOutput): Boolean =
-        !output.ended && !output.key.session.isClosed && screenOwners[output.key.type] === output
+        !output.ended && !output.key.session.isClosed && registeredScreen(output)
 
-    /** Caller holds screenOwnershipLock; only the current owner may stop the shared renderer. */
-    private fun removeScreen(output: ScreenOutput): Boolean {
-        if (screenOwners[output.key.type] !== output) return false
-        screenOwners.remove(output.key.type)
+    private fun registeredScreen(output: ScreenOutput): Boolean = screenOutputs[output.key] === output &&
+        (!screenSessionPolicy.isolateSessions || screenOwners[output.key.type] === output)
+
+    private fun retiredScreen(session: AirPlaySession, type: Int): Boolean =
+        screenSessionPolicy.isolateSessions && retiredScreens[session]?.contains(type) == true
+
+    private fun forgetScreen(output: ScreenOutput) {
+        screenOutputs.remove(output.key, output)
+        if (screenOwners[output.key.type] === output) screenOwners.remove(output.key.type)
         streams.remove(output.key, output.stream)
+    }
+
+    /** Caller holds screenOwnershipLock; registration follows the captured isolation policy. */
+    private fun removeScreen(output: ScreenOutput): Boolean {
+        if (!registeredScreen(output)) return false
+        forgetScreen(output)
         sink.onScreenStreamActive(output.key.type, false)
         return true
     }
@@ -592,7 +619,9 @@ class CarPlayMediaEngine(
     override fun onTeardown(session: AirPlaySession, type: Int) {
         if (isScreenStreamType(type)) {
             val output = synchronized(screenOwnershipLock) {
-                screenOwners[type]?.takeIf { it.key.session === session }?.also { removeScreen(it) }
+                screenOutputs[StreamKey(session, type)]?.also { removeScreen(it) }.also {
+                    if (it == null && !screenSessionPolicy.isolateSessions) sink.onScreenStreamActive(type, false)
+                }
             }
             output?.stream?.close()
             return
@@ -619,7 +648,7 @@ class CarPlayMediaEngine(
     override fun onSessionClosed(session: AirPlaySession) {
         val screens = synchronized(screenOwnershipLock) {
             retireScreenSession(session)
-            screenOwners.values.filter { it.key.session === session }.also { owned ->
+            screenOutputs.values.filter { it.key.session === session }.also { owned ->
                 owned.forEach { removeScreen(it) }
             }
         }

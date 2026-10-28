@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-License-Identifier: GPL-3.0-only
+// Created by riko chen on 2026-10-27
 package com.shilapi.xcertplay.airplay
 
 import java.io.Closeable
@@ -7,7 +10,12 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [29], manifest = Config.NONE)
 class CarPlayMediaEngineTest {
     @Test
     fun streamConnectionIdUsesUnsignedDecimalForHkdfSalt() {
@@ -19,7 +27,7 @@ class CarPlayMediaEngineTest {
     }
 
     @Test
-    fun screenStreamTeardownReportsInactive() {
+    fun unknownScreenTeardownDoesNotStopTheSink() {
         val events = mutableListOf<Pair<Int, Boolean>>()
         val sink = object : MediaSink {
             override fun onScreenStreamActive(type: Int, active: Boolean) {
@@ -36,7 +44,7 @@ class CarPlayMediaEngineTest {
             session.close()
         }
 
-        assertEquals(listOf(110 to false), events)
+        assertTrue(events.isEmpty())
     }
 
     @Test
@@ -55,8 +63,11 @@ class CarPlayMediaEngineTest {
         @Suppress("UNCHECKED_CAST")
         val streams = streamsField.get(engine) as
             MutableMap<CarPlayMediaEngine.StreamKey, Closeable>
-        streams[CarPlayMediaEngine.StreamKey(session, 110)] = Closeable {}
-        streams[CarPlayMediaEngine.StreamKey(session, 111)] = Closeable {}
+        PairVerify::class.java.getDeclaredField("sharedSecret").apply { isAccessible = true }
+            .set(session.pairVerify, ByteArray(32))
+        engine.onScreen(session, 110, mapOf("streamConnectionID" to 1L))
+        engine.onScreen(session, 111, mapOf("streamConnectionID" to 2L))
+        events.clear()
         streams[CarPlayMediaEngine.StreamKey(session, 100)] = Closeable {}
 
         engine.onSessionClosed(session)

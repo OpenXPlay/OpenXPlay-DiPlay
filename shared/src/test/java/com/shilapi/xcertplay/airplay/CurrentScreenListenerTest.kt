@@ -1,13 +1,19 @@
+// SPDX-FileCopyrightText: 2026 OpenXPlay.org
+// SPDX-License-Identifier: GPL-3.0-only
+// Created by riko chen on 2026-10-27
 package com.shilapi.xcertplay.airplay
 
 import java.io.Closeable
 import java.net.Socket
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -100,6 +106,55 @@ class CurrentScreenListenerTest {
             listOf(Event.Codec(110, VideoCodec.H264), Event.CodecData(110, config.toList())),
             sink.take(),
         )
+    }
+
+    @Test
+    fun replacementWaitsUntilAnInFlightDeliveryFinishes() {
+        val lock = Any()
+        var current = true
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val replacing = CountDownLatch(1)
+        val replaced = CountDownLatch(1)
+        val events = Collections.synchronizedList(mutableListOf<String>())
+        val sink = object : MediaSink {
+            override fun onVideoFrame(type: Int, naluBytes: ByteArray) {
+                events += "old-frame-start"
+                entered.countDown()
+                check(release.await(5, TimeUnit.SECONDS))
+                events += "old-frame-end"
+            }
+        }
+        val listener = currentScreenListener(110, sink, {}, { current }, lock)
+        val delivery = Thread { listener.onFrame(frame) }
+        val replacement = Thread {
+            replacing.countDown()
+            synchronized(lock) { current = false; events += "replacement" }
+            replaced.countDown()
+        }
+        try {
+            delivery.start()
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            replacement.start()
+            assertTrue(replacing.await(5, TimeUnit.SECONDS))
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            while (replacement.state != Thread.State.BLOCKED && replaced.count > 0 && System.nanoTime() < deadline) {
+                Thread.yield()
+            }
+            assertEquals(Thread.State.BLOCKED, replacement.state)
+            assertEquals(1L, replaced.count)
+            release.countDown()
+            delivery.join(5_000)
+            replacement.join(5_000)
+            assertFalse(delivery.isAlive)
+            assertFalse(replacement.isAlive)
+            listener.onFrame(frame)
+            assertEquals(listOf("old-frame-start", "old-frame-end", "replacement"), events.toList())
+        } finally {
+            release.countDown()
+            delivery.join(5_000)
+            replacement.join(5_000)
+        }
     }
 
     @Test

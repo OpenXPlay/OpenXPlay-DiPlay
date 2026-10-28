@@ -9,6 +9,8 @@ import com.shilapi.xcertplay.airplay.MediaSink
 import com.shilapi.xcertplay.airplay.MediaSinkDecorator
 import com.shilapi.xcertplay.airplay.MediaSinkDecoratorProvider
 import com.shilapi.xcertplay.airplay.SessionControl
+import com.shilapi.xcertplay.airplay.ScreenSessionPolicy
+import com.shilapi.xcertplay.airplay.ScreenSessionPolicyProvider
 import com.shilapi.xcertplay.media.AndroidMediaSink
 import java.util.concurrent.ExecutorService
 import org.junit.After
@@ -25,7 +27,8 @@ import org.robolectric.annotation.Config
 class MediaSinkDecoratorTest {
     private lateinit var activity: CarPlayHostActivity
 
-    class DecoratingApplication : Application(), MediaSinkDecoratorProvider {
+    class DecoratingApplication : Application(), MediaSinkDecoratorProvider, ScreenSessionPolicyProvider {
+        override var screenSessionPolicy = ScreenSessionPolicy(false, false, false)
         val decoratedSink = object : MediaSink {}
         var originalSink: MediaSink? = null
         var control: SessionControl? = null
@@ -57,12 +60,30 @@ class MediaSinkDecoratorTest {
         val sink = mock(AndroidMediaSink::class.java)
 
         assertSame(sink, engineSink(sink))
+        assertEquals(ScreenSessionPolicy(), policy(engine(sink)))
     }
 
+    @Test
+    @Config(application = DecoratingApplication::class)
+    fun mediaPolicyIsCapturedByEachNewEngine() {
+        activity = Robolectric.buildActivity(CarPlayHostActivity::class.java).get()
+        val application = activity.application as DecoratingApplication
+        val sink = mock(AndroidMediaSink::class.java)
+        val first = engine(sink)
+        application.screenSessionPolicy = ScreenSessionPolicy()
+        assertEquals(ScreenSessionPolicy(false, false, false), policy(first))
+        assertEquals(ScreenSessionPolicy(), policy(engine(sink)))
+    }
+
+    private fun policy(engine: CarPlayMediaEngine) = CarPlayMediaEngine::class.java
+        .getDeclaredField("screenSessionPolicy").apply { isAccessible = true }.get(engine) as ScreenSessionPolicy
+
+    private fun engine(sink: AndroidMediaSink): CarPlayMediaEngine = CarPlayHostActivity::class.java
+        .getDeclaredMethod("createMediaEngine", AndroidMediaSink::class.java)
+        .apply { isAccessible = true }.invoke(activity, sink) as CarPlayMediaEngine
+
     private fun engineSink(sink: AndroidMediaSink): MediaSink {
-        val engine = CarPlayHostActivity::class.java
-            .getDeclaredMethod("createMediaEngine", AndroidMediaSink::class.java)
-            .apply { isAccessible = true }.invoke(activity, sink)
+        val engine = engine(sink)
         return CarPlayMediaEngine::class.java.getDeclaredField("sink")
             .apply { isAccessible = true }.get(engine) as MediaSink
     }

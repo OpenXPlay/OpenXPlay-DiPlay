@@ -102,6 +102,7 @@ class AirPlaySession(
     private var eventCseq = 0
     private var pendingNightMode: Boolean? = null
     private val firstTouchSendLogged = AtomicBoolean(false)
+    private val iapChannelNegotiationLogged = AtomicBoolean(false)
     private val touchSendFailureLogged = AtomicBoolean(false)
     private val ntp = NtpClock()
     private var keepAliveSocket: DatagramSocket? = null
@@ -690,7 +691,12 @@ class AirPlaySession(
         if (dict["keepAliveLowPower"] == true || dict["keepAliveLowPower"] == 1L) {
             response["keepAlivePort"] = openKeepAlive()
         }
-        val features = setupEnabledFeatures(config, dict["features"] as? List<*>)
+        val proposed = dict["features"] as? List<*>
+        val features = setupEnabledFeatures(config, proposed)
+        if (iapChannelNegotiationLogged.compareAndSet(false, true)) {
+            debugLog("airplay iAPChannel offered=${proposed.orEmpty().contains("iAPChannel")} " +
+                "enabled=${features.contains("iAPChannel")} onlyWhenOffered=${config.iapChannelOnlyWhenOffered}")
+        }
         val videoPlaybackEnabled = VideoInCar.FEATURE in features
         val videoDelivery = videoPlaybackAvailability.setFeatureEnabled(videoPlaybackEnabled)
         debugLog("airplay video playback negotiated=$videoPlaybackEnabled availability=$videoDelivery")
@@ -1019,7 +1025,7 @@ internal fun findIphoneCornerMask(value: Any?, depth: Int = 0): ByteArray? {
 internal fun setupEnabledFeatures(config: AirPlayConfig, proposed: List<*>?): List<String> {
     val features = mutableListOf<String>()
     if (config.hevc) features.add("hevc")
-    features.add("iAPChannel")
+    if (!config.iapChannelOnlyWhenOffered || proposed.orEmpty().contains("iAPChannel")) features.add("iAPChannel")
     features.add("viewAreas")
     if (config.cluster != null) features.add("altScreen")
     if (config.main.useIphoneCornerMask && proposed.orEmpty().contains("cornerMasks")) features.add("cornerMasks")

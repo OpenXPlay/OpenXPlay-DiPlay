@@ -596,9 +596,12 @@ class CarPlayHostActivity : ComponentActivity() {
     private var restartGeneration = 0
     private var reconnectScheduled = false
     private var controlRunningCount = 0L
+    private var airPlaySessionActivations = 0L
     private var lossSinceControlRunning = false
     private val cancelRecoveredRetries: Boolean get() =
         (application as? com.shilapi.xcertplay.orchestration.WirelessConnectionPolicyProvider)?.cancelRecoveredRetries ?: true
+    private val awaitIphoneReconnect: Boolean get() =
+        (application as? com.shilapi.xcertplay.orchestration.WirelessConnectionPolicyProvider)?.awaitIphoneReconnect == true
     private var requestedSmallWindowForStream: Boolean? = null
     @Volatile private var adbNaviMode: com.shilapi.xcertplay.hud.BydClusterNaviMode? = null
     private var sessionLog: SessionLogFile? = null
@@ -4971,6 +4974,8 @@ class CarPlayHostActivity : ComponentActivity() {
             mainBufferedAudio = AirPlayPersistence.loadMainBufferedAudio(this),
             speechWithout8And16Khz = AirPlayPersistence.loadSpeechWithout8And16Khz(this),
             disableAudioOutput = carBluetoothAudio,
+            iapChannelOnlyWhenOffered = (application as? com.shilapi.xcertplay.orchestration.WirelessConnectionPolicyProvider)
+                ?.iapChannelOnlyWhenOffered == true,
         )
     }
 
@@ -5238,6 +5243,7 @@ class CarPlayHostActivity : ComponentActivity() {
                         return@runOnUiThread
                     }
                     activeAirPlaySession = session
+                    airPlaySessionActivations += 1
                     val pending = pendingIphoneCornerMask
                     if (pending?.first === session) {
                         installIphoneCornerMask(session, pending.second.first, pending.second.second)
@@ -5297,7 +5303,10 @@ class CarPlayHostActivity : ComponentActivity() {
                     ClusterActivityOutput.setStreamActive(false)
                     setConnectionStage(R.string.carplay_session_ended_reconnecting)
                     appendLog("AirPlay session ended; reconnecting from scratch")
-                    reconnectAfterLoss("AirPlay session ended")
+                    val minimumDelayMillis = AirPlayReconnectPolicy.minimumDelayMillis(
+                        enabled = awaitIphoneReconnect, wireless = wirelessEnabled, wasActive = active != null,
+                    )
+                    reconnectAfterLoss("AirPlay session ended", minimumDelayMillis = minimumDelayMillis)
                 }
             }
 
@@ -5901,6 +5910,7 @@ class CarPlayHostActivity : ComponentActivity() {
         reason: String,
         startupFailure: WirelessStartupFailure? = null,
         englishReason: String = reason,
+        minimumDelayMillis: Long = 0L,
     ) {
         if (!CarPlayBackgroundSession.isOwner(this)) return
         if (menuOpen) recoveryPendingAfterMenu = true
@@ -5930,12 +5940,19 @@ class CarPlayHostActivity : ComponentActivity() {
         updateCallPopupGuard()
         val generation = restartGeneration
         val runningAtSchedule = controlRunningCount
-        val delayMillis = if (startupDelay != null) {
+        val activationsAtSchedule = airPlaySessionActivations
+        val computedDelayMillis = if (startupDelay != null) {
             startupDelay
         } else if (reason.contains("AirPlay iAP tunnel", ignoreCase = true)) {
             IAP_TUNNEL_RECONNECT_DELAY_MILLIS
         } else {
             (RECONNECT_DELAY_MILLIS * (1L shl reconnectAttempts.coerceAtMost(4))).coerceAtMost(30_000L)
+        }
+        val delayMillis = AirPlayReconnectPolicy.delayMillis(computedDelayMillis, minimumDelayMillis)
+        if (minimumDelayMillis > 0) {
+            val message = "AirPlay session ended before RECORD; waiting ${delayMillis}ms for the iPhone to reconnect generation=$generation"
+            Log.i(TAG, message)
+            appendLog(message)
         }
         reconnectAttempts += 1
         appendLog("$reason; retrying in ${delayMillis}ms generation=$generation startupFailure=$startupFailure startupRetries=${startupRetryBudget.retries}")
@@ -5949,6 +5966,17 @@ class CarPlayHostActivity : ComponentActivity() {
                     handshakeResetInProgress || startupRetryStopped ||
                     generation != restartGeneration
                 ) {
+                    return@postDelayed
+                }
+                if (AirPlayReconnectPolicy.shouldCancelRestart(
+                        enabled = awaitIphoneReconnect,
+                        activationsAtSchedule = activationsAtSchedule,
+                        activations = airPlaySessionActivations,
+                        sessionActive = activeAirPlaySession != null,
+                    )) {
+                    val message = "Newer AirPlay session active; cancelling queued restart generation=$generation"
+                    Log.i(TAG, message)
+                    appendLog(message)
                     return@postDelayed
                 }
                 if (cancelRecoveredRetries && controlRunningCount != runningAtSchedule && !lossSinceControlRunning) {

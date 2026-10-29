@@ -48,7 +48,9 @@ class WirelessHandoffWatchdogTest {
         val listener = object : AirPlaySessionListener {
             override fun onDebugLog(message: String) { diagnostics += message }
         }
-        controller = CarPlayController(object : ContextWrapper(RuntimeEnvironment.getApplication()) {
+        controller = CarPlayController(object : ContextWrapper(RuntimeEnvironment.getApplication()), WirelessConnectionPolicyProvider {
+            override val wirelessNetworkRecoveryEnabled = false
+            override val releaseBluetoothOnHandoffRequest = true
             override fun getApplicationContext(): Context = this
             override fun bindService(service: Intent, conn: ServiceConnection, flags: Int): Boolean = false
         }, CarPlayRuntimeConfig(mfiTarget = MfiTarget.LOCAL, transport = CarPlayTransport.WIRELESS,
@@ -210,6 +212,62 @@ class WirelessHandoffWatchdogTest {
         assertFalse(flag("wirelessActiveReported").get())
         assertEquals(0, hotspotCloses)
         verify(bootstrap, never()).close()
+    }
+
+    @Test fun disableBluetoothReleasesOnlyBootstrapAfterFiveSeconds() {
+        requestBootstrapRelease()
+        shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(4_999))
+        verify(bootstrap, never()).close()
+        ReflectionHelpers.getField<AirPlaySessionListener>(controller, "sessionListener")
+            .onCommand(session, "disableBluetooth", emptyMap())
+        shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(1))
+        verify(bootstrap, timeout(2_000).times(1)).close()
+        assertTrue(flag("wirelessBootstrapReleased").get())
+        assertEquals(0, hotspotCloses)
+        assertSame(session, ReflectionHelpers.getField(controller, "activeSession"))
+        assertTrue(statuses.isEmpty())
+        shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(5))
+        verify(bootstrap, after(200).times(1)).close()
+        assertEquals(1, diagnostics.count { it.startsWith("wireless handoff: releasing Bluetooth bootstrap") })
+    }
+
+    @Test fun queuedBootstrapReleaseCannotCloseTheNextGeneration() {
+        requestBootstrapRelease()
+        ReflectionHelpers.getField<AtomicInteger>(controller, "wirelessGeneration").incrementAndGet()
+        shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(5))
+        verify(bootstrap, after(200).never()).close()
+        assertFalse(flag("wirelessBootstrapReleased").get())
+    }
+
+    @Test fun videoAfterBootstrapReleaseFallsBackWithoutClaimingBluetoothIsKept() {
+        requestBootstrapRelease()
+        shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(5))
+        verify(bootstrap, timeout(2_000).times(1)).close()
+        proofCall("rendered", 0, session)
+        timeout()
+        assertEquals(listOf(CarPlayStatus.WirelessActiveFallback), statuses)
+        assertEquals(0, hotspotCloses)
+        assertTrue(diagnostics.any { it.contains("preserving AirPlay; Bluetooth bootstrap already released") })
+        assertFalse(diagnostics.any { it.contains("keeping the Bluetooth bootstrap for iAP2 control") })
+        assertTrue(diagnostics.any { it.startsWith("STEP handoff/fallback:") && it.endsWith("Bluetooth bootstrap already released") })
+        assertFalse(diagnostics.any { it.contains("Bluetooth bootstrap preserved") })
+    }
+
+    @Test fun releasedBootstrapStillFailsAtTheWatchdogWithoutVideo() {
+        requestBootstrapRelease()
+        shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(5))
+        verify(bootstrap, timeout(2_000).times(1)).close()
+        timeout()
+        assertTrue(statuses.single() is CarPlayStatus.Failed)
+        assertEquals(1, hotspotCloses)
+        assertFalse(flag("wirelessBootstrapReleased").get())
+        verify(bootstrap, times(1)).close()
+    }
+
+    private fun requestBootstrapRelease() {
+        flag("wirelessHandoffRequested").set(false)
+        ReflectionHelpers.getField<AirPlaySessionListener>(controller, "sessionListener")
+            .onCommand(session, "disableBluetooth", emptyMap())
     }
 
     private fun timeout() {

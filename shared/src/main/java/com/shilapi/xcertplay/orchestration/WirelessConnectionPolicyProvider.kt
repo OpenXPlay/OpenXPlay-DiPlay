@@ -11,4 +11,7 @@ interface WirelessConnectionPolicyProvider {
     val cancelRecoveredRetries: Boolean get() = true
     val startupDiagnosticsEnabled: Boolean get() = false
     val networkObservationBackoffEnabled: Boolean get() = false
+    val iapChannelOnlyWhenOffered: Boolean get() = false
+    val releaseBluetoothOnHandoffRequest: Boolean get() = false
+    val awaitIphoneReconnect: Boolean get() = false
 }

@@ -189,6 +189,7 @@ class CarPlayController(
     private val wirelessNetworkRecovery =
         (appContext as? WirelessConnectionPolicyProvider)?.wirelessNetworkRecoveryEnabled == true
     private val startupDiagnosticsEnabled = (appContext as? WirelessConnectionPolicyProvider)?.startupDiagnosticsEnabled == true
+    private val releaseBluetoothOnHandoffRequest = (appContext as? WirelessConnectionPolicyProvider)?.releaseBluetoothOnHandoffRequest == true
     private val observationBackoff = (appContext as? WirelessConnectionPolicyProvider)?.networkObservationBackoffEnabled == true
     private val diagnosticAttempt = diagnosticAttempts.incrementAndGet()
     private val diagnosticRun = AtomicInteger()
@@ -299,6 +300,7 @@ class CarPlayController(
     private val wirelessActiveReported = AtomicBoolean(false)
     /** Set when the handoff fell back and kept Bluetooth as the only iAP2 channel. */
     private val wirelessHandoffFellBack = AtomicBoolean(false)
+    private val wirelessBootstrapReleased = AtomicBoolean(false)
     private val wirelessGeneration = AtomicInteger(0)
     private val wirelessConnectionProof = WirelessConnectionProof<AirPlaySession>()
 
@@ -455,7 +457,9 @@ class CarPlayController(
                     "wireless CarPlay Bluetooth handoff requested; " +
                         "waiting for tunnel iAP2 readiness",
                 )
-                armWirelessHandoffWatchdog(wirelessGeneration.get())
+                val generation = wirelessGeneration.get()
+                armWirelessHandoffWatchdog(generation)
+                if (releaseBluetoothOnHandoffRequest) armBluetoothBootstrapRelease(generation, session)
                 maybeCompleteWirelessHandoff()
             }
             notifyObserver { onCommand(type, params) }
@@ -1244,6 +1248,7 @@ class CarPlayController(
             wirelessTunnelReady.set(false)
             wirelessActiveReported.set(false)
             wirelessHandoffFellBack.set(false)
+            wirelessBootstrapReleased.set(false)
             val next = wirelessGeneration.incrementAndGet()
             onStatus(CarPlayStatus.StartingHotspot, next)
             next
@@ -1632,12 +1637,25 @@ class CarPlayController(
                     }
                 }
                 Iap2WirelessControlTerminal.TIMED_OUT ->
-                    if (!wirelessActiveReported.get()) {
+                    if (WirelessBluetoothBootstrapPolicy.shouldReportTimeout(
+                            wirelessActive = wirelessActiveReported.get(),
+                            bootstrapReleased = wirelessBootstrapReleased.get(),
+                            sameGeneration = generation == wirelessGeneration.get(),
+                        )) {
                         onStatus(CarPlayStatus.ControlEnded)
                     }
             }
         } catch (error: Throwable) {
             if (isStaleWirelessRun(generation)) {
+                return
+            }
+            if (WirelessBluetoothBootstrapPolicy.toleratesError(
+                    bootstrapReleased = wirelessBootstrapReleased.get(),
+                    sameGeneration = generation == wirelessGeneration.get(),
+                    sessionActive = activeSession != null,
+                    error = error,
+                )) {
+                debugLog("wireless Bluetooth bootstrap released for handoff; keeping the Wi-Fi AirPlay tunnel alive: ${error.message}")
                 return
             }
             if (wirelessActiveReported.get() && error !is Error) {
@@ -1878,6 +1896,41 @@ class CarPlayController(
             wirelessConnectionProof.hasRenderedFrame(generation)
     }
 
+    private fun armBluetoothBootstrapRelease(generation: Int, session: AirPlaySession) {
+        mainHandler.postDelayed(
+            {
+                // Teardown can hold the lock for seconds; never wait for it on the main thread.
+                Thread(
+                    { releaseBluetoothBootstrap(generation, session) },
+                    "xcertplay-wireless-bootstrap-release",
+                ).apply {
+                    isDaemon = true
+                    start()
+                }
+            },
+            BLUETOOTH_RELEASE_GRACE_MILLIS,
+        )
+    }
+
+    private fun releaseBluetoothBootstrap(generation: Int, session: AirPlaySession) = synchronized(wirelessResourceLock) {
+        if (!WirelessBluetoothBootstrapPolicy.shouldRelease(
+                closed = closed,
+                wireless = phase == Phase.WIRELESS,
+                sameGeneration = generation == wirelessGeneration.get(),
+                sameSession = activeSession === session,
+                failureReported = wirelessFailureReported.get(),
+                handoffRequested = wirelessHandoffRequested.get(),
+                tunnelReady = wirelessTunnelReady.get(),
+                wirelessActive = wirelessActiveReported.get(),
+                frameRendered = wirelessConnectionProof.hasRenderedFrame(generation),
+                bootstrapReleased = wirelessBootstrapReleased.get(),
+            )) return@synchronized
+        wirelessBootstrapReleased.set(true)
+        debugLog("wireless handoff: releasing Bluetooth bootstrap after disableBluetooth graceMs=$BLUETOOTH_RELEASE_GRACE_MILLIS; " +
+            "no tunnel iAP2 or video; keeping AirPlay, hotspot and Bonjour")
+        closeBluetoothBootstrapTransport()
+    }
+
     private fun armWirelessHandoffWatchdog(generation: Int) {
         mainHandler.postDelayed(
             {
@@ -1917,7 +1970,8 @@ class CarPlayController(
             // route guidance and call updates for the rest of the session, so keep it until the
             // tunnel really takes over (see maybeCompleteWirelessHandoff).
             debugLog("wireless handoff fallback after rendered video; tunnel iAP2 unavailable; " +
-                "preserving AirPlay and keeping the Bluetooth bootstrap for iAP2 control")
+                if (wirelessBootstrapReleased.get()) "preserving AirPlay; Bluetooth bootstrap already released"
+                else "preserving AirPlay and keeping the Bluetooth bootstrap for iAP2 control")
             onStatus(CarPlayStatus.WirelessActiveFallback, generation)
         } else {
             closeWirelessStack(generation = generation)
@@ -2753,6 +2807,7 @@ class CarPlayController(
             wirelessTunnelReady.set(false)
             wirelessActiveReported.set(false)
             wirelessHandoffFellBack.set(false)
+            wirelessBootstrapReleased.set(false)
 
             if (service != null && owner != null) closeBestEffort("AirPlay service") { service.detachWireless(owner) }
         }
@@ -3130,7 +3185,8 @@ class CarPlayController(
         CarPlayStatus.WirelessActive ->
             "STEP handoff/complete: tunnel iAP2 ready; Bluetooth bootstrap released"
         CarPlayStatus.WirelessActiveFallback ->
-            "STEP handoff/fallback: rendered video preserved; tunnel iAP2 unavailable; Bluetooth bootstrap preserved"
+            "STEP handoff/fallback: rendered video preserved; tunnel iAP2 unavailable; " +
+                if (wirelessBootstrapReleased.get()) "Bluetooth bootstrap already released" else "Bluetooth bootstrap preserved"
         CarPlayStatus.DiscoveringIphone ->
             "STEP usb/discover: searching for an iPhone USB device"
         CarPlayStatus.WaitingForIphone ->
@@ -3179,6 +3235,7 @@ class CarPlayController(
         private const val PERMISSION_POLL_TIMEOUT_MILLIS = 120_000L
         private const val DEVICE_AVAILABILITY_POLL_INTERVAL_MILLIS = 2_000L
         private const val WIRELESS_HANDOFF_TIMEOUT_MILLIS = 45_000L
+        private const val BLUETOOTH_RELEASE_GRACE_MILLIS = 5_000L
         private const val RFCOMM_CONNECT_TIMEOUT_MILLIS = 15_000L
         private const val MAXIMUM_REENUMERATION_ATTEMPTS = 2
         private const val START_SESSION_PROGRESS = "iap2 tx=0x4301"

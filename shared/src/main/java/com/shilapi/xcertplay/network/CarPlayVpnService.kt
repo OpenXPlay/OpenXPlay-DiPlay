@@ -14,9 +14,12 @@ import com.shilapi.xcertplay.airplay.AirPlayConfig
 import com.shilapi.xcertplay.airplay.AirPlayIdentity
 import com.shilapi.xcertplay.airplay.AirPlayMediaHandler
 import com.shilapi.xcertplay.airplay.AirPlaySession
+import com.shilapi.xcertplay.airplay.AirPlayControlDiagnostics
 import com.shilapi.xcertplay.airplay.AirPlaySessionListener
 import com.shilapi.xcertplay.airplay.PairingStore
 import com.shilapi.xcertplay.mfi.MfiAuthenticator
+import com.shilapi.xcertplay.orchestration.CarPlayLinkEnd
+import com.shilapi.xcertplay.orchestration.CarPlayLinkDiagnostics
 import com.shilapi.xcertplay.transport.NcmUsbBridge
 import java.io.IOException
 import java.net.Inet6Address
@@ -66,6 +69,7 @@ class CarPlayVpnService : VpnService() {
     private var bridge: Ipv6NcmBridge? = null
     private var tun: ParcelFileDescriptor? = null
     private var attachGeneration = 0
+    private var connectionNumber = 0
 
     /** The exception chain behind the latest [AttachResult.Failed], for the diagnostic log. */
     @Volatile var lastAttachFailure: String? = null
@@ -91,6 +95,7 @@ class CarPlayVpnService : VpnService() {
         }
         active.set(true)
         val generation = ++attachGeneration
+        connectionNumber = 0
         return try {
             val address = InetAddress.getByName(linkLocal)
             if (address !is Inet6Address || !address.isLinkLocalAddress) {
@@ -151,6 +156,7 @@ class CarPlayVpnService : VpnService() {
         }
         active.set(true)
         val generation = ++attachGeneration
+        connectionNumber = 0
         return try {
             startAirPlayServer(
                 generation,
@@ -182,6 +188,10 @@ class CarPlayVpnService : VpnService() {
     fun boundPort(): Int? = attachment?.config?.port
 
     override fun onDestroy() {
+        attachment?.let { current -> runCatching { current.listener.onLinkEnded(
+            CarPlayLinkEnd(
+                if (current.listenerIdentity == null) "usb" else "wireless_run",
+                "transport_attached", "os", "stopped", "vpn_service_destroyed")) } }
         detach()
         super.onDestroy()
     }
@@ -251,22 +261,40 @@ class CarPlayVpnService : VpnService() {
         generation: Int,
         server: ServerSocket,
     ) {
+        val owner = synchronized(this) { if (generation != attachGeneration) return else attachment ?: return }
         try {
             while (active.get()) {
                 val socket: Socket = server.accept()
                 val acceptedAtNanos = System.nanoTime()
+                val number = synchronized(this) { if (generation == attachGeneration) ++connectionNumber else -1 }
+                fun endUnstarted(cause: String, detail: String = "") {
+                    if (owner.listenerIdentity != null && isInternalAirPlayPeer(socket.inetAddress, socket.localAddress)) {
+                        runCatching { owner.listener.onDebugLog("airplay internal probe ended by=local cause=$cause") }
+                        return
+                    }
+                    runCatching { owner.listener.onLinkEnded(CarPlayLinkEnd("airplay_control", "tcp_accepted", "local", cause,
+                        detail, (System.nanoTime() - acceptedAtNanos).coerceAtLeast(0) / 1_000_000,
+                        facts = AirPlayControlDiagnostics.openingFacts(number))) }
+                }
                 Log.i(TAG, "airplay connection accepted from ${socket.remoteSocketAddress}")
-                socket.tcpNoDelay = true
-                socket.keepAlive = true
-                socket.setSoLinger(true, 0)
+                try {
+                    socket.tcpNoDelay = true
+                    socket.keepAlive = true
+                    socket.setSoLinger(true, 0)
+                } catch (error: IOException) {
+                    endUnstarted("io_error", CarPlayLinkDiagnostics.failureDetail(error))
+                    throw error
+                }
                 val session = synchronized(this) {
                     if (!active.get() || generation != attachGeneration ||
                         (serverSocket !== server && additionalServers.none { it === server })) {
+                        endUnstarted("teardown")
                         socket.close()
                         return
                     }
                     val current = attachment
                     if (current == null) {
+                        endUnstarted("teardown")
                         socket.close()
                         return
                     }
@@ -286,6 +314,11 @@ class CarPlayVpnService : VpnService() {
                         pairings = current.pairings,
                         mfi = current.mfi,
                         listener = object : AirPlaySessionListener by current.listener {
+                            override fun onLinkEnded(end: CarPlayLinkEnd) {
+                                if (current.listenerIdentity == null || !internalPeer) current.listener.onLinkEnded(end)
+                                else runCatching { current.listener.onDebugLog("airplay internal probe ended by=${end.by} cause=${end.cause} age=${end.ageMillis}") }
+                            }
+
                             override fun onSessionActive(session: AirPlaySession) {
                                 if (current.listenerIdentity == null || !internalPeer) current.listener.onSessionActive(session)
                             }
@@ -308,7 +341,7 @@ class CarPlayVpnService : VpnService() {
                             }
                         },
                         media = current.media,
-                    ).also(::addSession)
+                    ).also { it.connectionNumber = number; addSession(it) }
                 }
                 session.start()
             }

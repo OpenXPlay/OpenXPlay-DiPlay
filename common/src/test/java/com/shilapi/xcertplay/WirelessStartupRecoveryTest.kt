@@ -3,15 +3,30 @@
 // Created by riko chen on 2026-10-27
 package com.shilapi.xcertplay
 
+import android.app.Application
 import android.os.Handler
 import android.os.Looper
 import android.view.View
 import android.widget.Button
 import android.widget.TextView
+import com.shilapi.xcertplay.airplay.AirPlayConfig
+import com.shilapi.xcertplay.airplay.AirPlayDisplayConfig
+import com.shilapi.xcertplay.airplay.AirPlayIdentity
+import com.shilapi.xcertplay.airplay.AirPlayMediaHandler
+import com.shilapi.xcertplay.airplay.AirPlaySessionListener
+import com.shilapi.xcertplay.airplay.PairingStore
 import com.shilapi.xcertplay.host.R
 import com.shilapi.xcertplay.network.WirelessStartupException
 import com.shilapi.xcertplay.network.WirelessStartupFailure
+import com.shilapi.xcertplay.orchestration.CarPlayController
+import com.shilapi.xcertplay.orchestration.CarPlayEventObserver
+import com.shilapi.xcertplay.orchestration.CarPlayEventObserverProvider
+import com.shilapi.xcertplay.orchestration.CarPlayLinkEnd
+import com.shilapi.xcertplay.orchestration.CarPlayRuntimeConfig
 import com.shilapi.xcertplay.orchestration.CarPlayStatus
+import com.shilapi.xcertplay.orchestration.CarPlayTransport
+import com.shilapi.xcertplay.orchestration.MfiTarget
+import com.shilapi.xcertplay.transport.Iap2IdentificationConfig
 import com.shilapi.xcertplay.transport.BluetoothLinkCheck
 import com.shilapi.xcertplay.transport.BluetoothRadioCheck
 import org.junit.After
@@ -25,12 +40,21 @@ import org.robolectric.annotation.Config
 import org.robolectric.annotation.LooperMode
 import org.robolectric.util.ReflectionHelpers
 import org.robolectric.util.ReflectionHelpers.ClassParameter.from
+import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], qualifiers = "en", manifest = Config.NONE)
 @LooperMode(LooperMode.Mode.PAUSED)
 class WirelessStartupRecoveryTest {
+    class LinkApplication : Application(), CarPlayEventObserverProvider {
+        val ends = mutableListOf<CarPlayLinkEnd>()
+        override val carPlayEventObserver = object : CarPlayEventObserver {
+            override fun onLinkEnded(end: CarPlayLinkEnd) { ends += end }
+        }
+    }
+
+    private val controllers = mutableListOf<CarPlayController>()
     private lateinit var activity: CarPlayHostActivity
     private lateinit var retry: Button
     private val failure = CarPlayStatus.Failed("timeout", startupFailure = WirelessStartupFailure.FIRST_TCP_TIMEOUT)
@@ -45,6 +69,8 @@ class WirelessStartupRecoveryTest {
     }
 
     @After fun cleanup() {
+        controllers.forEach { it.close(); assertTrue(it.awaitClosed(2_000)) }
+        org.robolectric.Shadows.shadowOf(Looper.getMainLooper()).idle()
         ReflectionHelpers.getField<Handler>(activity, "mainHandler").removeCallbacksAndMessages(null)
         CarPlayBackgroundSession.clear()
     }
@@ -54,6 +80,114 @@ class WirelessStartupRecoveryTest {
             from(Int::class.javaPrimitiveType, generation))(status)
     }
     private fun budget() = ReflectionHelpers.getField<WirelessStartupRetryBudget>(activity, "startupRetryBudget")
+
+    private fun controller(transport: CarPlayTransport): CarPlayController {
+        val controller = CarPlayController(activity,
+            CarPlayRuntimeConfig(mfiTarget = MfiTarget.LOCAL, transport = transport,
+                identification = Iap2IdentificationConfig("test", "test", "test", "test", "1", "1", carPlayUsbInterfaceNumber = 3)),
+            AirPlayConfig("test", "test", "", "1", AirPlayDisplayConfig(800, 480)),
+            AirPlayIdentity(ByteArray(32), ByteArray(32), "test"), PairingStore(),
+            object : AirPlaySessionListener {}, object : AirPlayMediaHandler {}, {})
+        controllers += controller
+        ReflectionHelpers.setField(activity, "controller", controller)
+        // Install an unstarted phone link without touching Bluetooth, USB or hotspot hardware.
+        val type = Class.forName("com.shilapi.xcertplay.orchestration.CarPlayLinkDiagnostics")
+        val deliver: (CarPlayLinkEnd) -> Unit = { end ->
+            CarPlayController::class.java.getDeclaredMethod("reportLinkEnd", CarPlayLinkEnd::class.java)
+                .apply { isAccessible = true }.invoke(controller, end)
+        }
+        val now: () -> Long = System::nanoTime
+        val link = type.getDeclaredConstructor(String::class.java, Function1::class.java, Function0::class.java)
+            .apply { isAccessible = true }.newInstance(if (transport == CarPlayTransport.WIRELESS) "wireless_run" else "usb", deliver, now)
+        ReflectionHelpers.setField(controller, if (transport == CarPlayTransport.WIRELESS) "wirelessEnd" else "usbEnd", link)
+        return controller
+    }
+
+    private fun noteFailure(controller: CarPlayController) {
+        CarPlayController::class.java.getDeclaredMethod("fail", Throwable::class.java, Int::class.javaObjectType)
+            .apply { isAccessible = true }.invoke(controller, IOException("socket failed"), null)
+        org.robolectric.Shadows.shadowOf(Looper.getMainLooper()).idle()
+        assertTrue((activity.application as LinkApplication).ends.isEmpty())
+    }
+
+    private fun assertDecision(controller: CarPlayController, transport: CarPlayTransport, next: String, delay: String) {
+        org.robolectric.Shadows.shadowOf(Looper.getMainLooper()).idle()
+        val ends = (activity.application as LinkApplication).ends
+        val end = ends.single()
+        controller.close()
+        assertTrue(controller.awaitClosed(2_000))
+        org.robolectric.Shadows.shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(listOf(end), ends)
+        assertEquals(if (transport == CarPlayTransport.WIRELESS) "wireless_run" else "usb", end.link)
+        assertEquals("local", end.by)
+        assertEquals(if (transport == CarPlayTransport.WIRELESS) "connect_failed" else "io_error", end.cause)
+        assertEquals("IOException: socket failed", end.detail)
+        assertEquals(next, end.facts["next"])
+        assertEquals(delay, end.facts["nextInMs"])
+        ends.clear()
+    }
+
+    @Test @Config(application = LinkApplication::class)
+    fun notedFailureThenActivityRetryReportsTheScheduledRebuildOnce() {
+        for (transport in CarPlayTransport.entries) {
+            ReflectionHelpers.setField(activity, "reconnectScheduled", false)
+            ReflectionHelpers.setField(activity, "reconnectAttempts", 0)
+            val controller = controller(transport)
+            noteFailure(controller)
+            report(status = CarPlayStatus.Failed("socket failed"))
+            assertTrue(ReflectionHelpers.getField(activity, "reconnectScheduled"))
+            assertDecision(controller, transport, "rebuild", "2000")
+        }
+    }
+
+    @Test @Config(application = LinkApplication::class)
+    fun notedFailureThenExhaustedRetriesReportsStopOnce() {
+        repeat(com.shilapi.xcertplay.network.WirelessStartupPolicy.MAX_STARTUP_RETRIES) { budget().nextDelayMillis() }
+        for (transport in CarPlayTransport.entries) {
+            ReflectionHelpers.setField(activity, "startupRetryStopped", false)
+            ReflectionHelpers.setField(activity, "startupFailureGeneration", -1)
+            val controller = controller(transport)
+            noteFailure(controller)
+            report()
+            assertTrue(ReflectionHelpers.getField(activity, "startupRetryStopped"))
+            assertDecision(controller, transport, "stop", "-")
+        }
+    }
+
+    @Test @Config(application = LinkApplication::class)
+    fun closeWithoutARecoveryDecisionReportsStopOnce() {
+        for (transport in CarPlayTransport.entries) {
+            val controller = controller(transport)
+            noteFailure(controller)
+            controller.close()
+            assertDecision(controller, transport, "stop", "-")
+        }
+    }
+
+    @Test @Config(application = LinkApplication::class)
+    fun closeWithoutAFailureReportsALocalStop() {
+        for (transport in CarPlayTransport.entries) {
+            val controller = controller(transport)
+            controller.close()
+            assertTrue(controller.awaitClosed(2_000))
+            org.robolectric.Shadows.shadowOf(Looper.getMainLooper()).idle()
+            val ends = (activity.application as LinkApplication).ends
+            assertEquals("local", ends.single().by)
+            assertEquals("stopped", ends.single().cause)
+            assertEquals(mapOf("next" to "stop", "nextInMs" to "-"), ends.single().facts)
+            ends.clear()
+        }
+    }
+
+    @Test @Config(application = LinkApplication::class)
+    fun activityReconnectGraceReportsWaitWithTheScheduledDelay() {
+        val controller = controller(CarPlayTransport.WIRELESS)
+        noteFailure(controller)
+        ReflectionHelpers.callInstanceMethod<Unit>(activity, "reconnectAfterLoss",
+            from(String::class.java, "AirPlay session ended"), from(WirelessStartupFailure::class.java, null),
+            from(String::class.java, "AirPlay session ended"), from(Long::class.javaPrimitiveType, 25_000L))
+        assertDecision(controller, CarPlayTransport.WIRELESS, "wait_iphone", "25000")
+    }
 
     @Test fun recoveredControlCancelsQueuedRetryButAnotherLossKeepsItEligible() {
         val log = java.io.File.createTempFile("retry-recovered", ".log")

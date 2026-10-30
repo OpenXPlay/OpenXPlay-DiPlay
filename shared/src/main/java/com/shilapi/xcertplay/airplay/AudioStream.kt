@@ -1,5 +1,7 @@
 package com.shilapi.xcertplay.airplay
 
+import com.shilapi.xcertplay.orchestration.CarPlayLinkEnd
+import com.shilapi.xcertplay.orchestration.CarPlayLinkDiagnostics
 import java.io.Closeable
 import java.io.IOException
 import java.net.DatagramPacket
@@ -47,6 +49,8 @@ class AudioStream(
         ) {}
     }
 
+    internal var onLinkEnded: (CarPlayLinkEnd) -> Unit = {}
+    private val linkEnd = CarPlayLinkDiagnostics("stream_audio", { onLinkEnded(it) })
     private val closed = AtomicBoolean(false)
     private val receivedPackets = AtomicInteger()
     private val decryptedPackets = AtomicInteger()
@@ -80,8 +84,14 @@ class AudioStream(
         return data.localPort to control.localPort
     }
 
+    internal fun close(cause: String) {
+        linkEnd.end(cause = cause, facts = mapOf("type" to "$streamType"), counters = true)
+        close()
+    }
+
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
+        linkEnd.end(facts = mapOf("type" to "$streamType"), counters = true)
         dataSocket?.close()
         controlSocket?.close()
         dataThread?.interrupt()
@@ -99,9 +109,16 @@ class AudioStream(
                 try {
                     stats.reading()
                     socket.receive(packet)
-                } catch (_: Exception) {
-                    if (closed.get()) return else continue
+                } catch (error: Exception) {
+                    if (closed.get()) return
+                    if (socket.isClosed) {
+                        linkEnd.failed(error, mapOf("type" to "$streamType", "channel" to "data"), true)
+                        return
+                    }
+                    continue
                 }
+                linkEnd.received(packet.length)
+                linkEnd.reached = "receiving"
                 stats.received(
                     size = packet.length,
                     sequence = if (packet.length >= RTP_HEADER_LEN) {
@@ -175,6 +192,9 @@ class AudioStream(
                 listener.onRtp(rtp, sample)
                 stats.processed()
             }
+        } catch (error: Exception) {
+            if (!closed.get()) linkEnd.failed(error, mapOf("type" to "$streamType"), true)
+            throw error
         } finally { stats.flush(ended = true) }
     }
 
@@ -183,16 +203,28 @@ class AudioStream(
         while (!closed.get()) {
             try {
                 socket.receive(DatagramPacket(buffer, buffer.size))
-            } catch (_: Exception) {
+            } catch (error: Exception) {
                 if (closed.get()) return
+                if (socket.isClosed) {
+                    linkEnd.failed(error, mapOf("type" to "$streamType", "channel" to "rtcp"), true)
+                    return
+                }
             }
         }
     }
 
     private fun bindAnyPort(): DatagramSocket {
-        val socket = DatagramSocket(null)
-        socket.reuseAddress = true
-        socket.bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+        val socket = try { DatagramSocket(null) } catch (error: Exception) {
+            linkEnd.failed(error, mapOf("type" to "$streamType"), true)
+            throw error
+        }
+        try {
+            socket.reuseAddress = true
+            socket.bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+        } catch (error: Exception) {
+            linkEnd.failed(error, mapOf("type" to "$streamType"), true)
+            throw error
+        }
         return socket
     }
 

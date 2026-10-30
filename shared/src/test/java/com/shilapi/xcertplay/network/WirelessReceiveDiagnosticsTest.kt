@@ -7,14 +7,25 @@ import java.io.File
 import java.io.IOException
 import org.junit.Assert.*
 import org.junit.Test
+import org.junit.Before
 
 class WirelessReceiveDiagnosticsTest {
-    @Test fun backoffReportsUnsupportedSourcesOncePerAttempt() {
+    @Before fun resetProcessDiagnostics() { WirelessReceiveDiagnostics.unavailableSources.clear() }
+
+    @Test fun unreadableProcFallsBackToUidBytesAndReportsUnavailableOncePerProcess() {
         var reads = 0
-        val diagnostics = WirelessReceiveDiagnostics("p2p0", { _, _ -> reads++; throw IOException("secret") }, suppressUnavailable = true)
-        assertEquals(3, diagnostics.snapshot().lines().size)
-        repeat(10) { assertEquals("", diagnostics.snapshot()) }
+        var bytes = 10L
+        fun diagnostics() = WirelessReceiveDiagnostics("p2p0", { _, _ -> reads++; throw IOException("secret") },
+            uidCounters = { mapOf("RxBytes" to bytes, "TxBytes" to bytes * 2) })
+        val first = diagnostics()
+        assertEquals(4, first.snapshot().lines().size)
+        bytes = 15
+        val second = first.snapshot()
+        assertTrue(second.contains("uidScope=app uid=sampled uidRxBytesDelta=5 uidTxBytesDelta=10"))
+        assertFalse(second.contains("unavailable"))
         assertEquals(3, reads)
+        assertFalse(diagnostics().snapshot().contains("unavailable"))
+        assertEquals(6, reads)
     }
 
     @Test fun fullWidthCounterDeltasFitOnSeparateExportableLines() {
@@ -90,11 +101,10 @@ class WirelessReceiveDiagnosticsTest {
         val first = diagnostics.snapshot()
         val second = diagnostics.snapshot()
         assertEquals(3, attempts)
-        for (result in listOf(first, second)) {
-            assertTrue(result.contains("ifaceRx=unavailable failureClass=SecurityException"))
-            assertTrue(result.contains("udp4=unavailable") && result.contains("udp6=unavailable"))
-            assertFalse(result.contains("password") || result.contains("phone") || result.contains("address"))
-        }
+        assertTrue(first.contains("ifaceRx=unavailable failureClass=SecurityException"))
+        assertTrue(first.contains("udp4=unavailable") && first.contains("udp6=unavailable"))
+        assertFalse(second.contains("unavailable"))
+        assertFalse((first + second).contains("password") || (first + second).contains("phone") || (first + second).contains("address"))
     }
 
     @Test fun interfaceNameCannotEscapeTheFixedStatisticsDirectory() {

@@ -14,6 +14,24 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class BluetoothRfcommDuplexStreamTest {
+    @Test fun eofAndIoFailureAreReportedOnceBeforeLocalCleanup() {
+        for ((input, expected) in listOf(
+            ByteArrayInputStream(byteArrayOf()) to "peer_eof",
+            FailingInput(IOException("read failed")) to "io_error")) {
+            val ends = CopyOnWriteArrayList<com.shilapi.xcertplay.orchestration.CarPlayLinkEnd>()
+            val ended = CountDownLatch(1)
+            val stream = BluetoothRfcommDuplexStream(FakeSocket(input), onLinkEnded = {
+                ends += it
+                ended.countDown()
+            })
+            assertTrue(ended.await(2, TimeUnit.SECONDS))
+            stream.close()
+            assertEquals(1, ends.size)
+            assertEquals(expected, ends.single().cause)
+            if (expected == "io_error") assertTrue(ends.single().detail.contains("read failed"))
+        }
+    }
+
     @Test fun bytesReceivedStaysZeroUntilThePeerDeliversSomething() {
         val silent = BluetoothRfcommDuplexStream(FakeSocket(BlockingInput()))
         assertNull(silent.recv(16, 50))
@@ -193,7 +211,7 @@ class BluetoothRfcommDuplexStreamTest {
     @Test fun failingDiagnosticCallbackCannotPreventGetterFailureCleanup() {
         val socket = FakeSocket(null)
 
-        expectFailure { BluetoothRfcommDuplexStream(socket) { throw IllegalStateException("diagnostic callback") } }
+        expectFailure { BluetoothRfcommDuplexStream(socket, onDiagnostic = { throw IllegalStateException("diagnostic callback") }) }
 
         assertEquals(1, socket.closes.get())
     }

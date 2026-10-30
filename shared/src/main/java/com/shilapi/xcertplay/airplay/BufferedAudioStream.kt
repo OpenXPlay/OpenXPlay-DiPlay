@@ -1,6 +1,8 @@
 package com.shilapi.xcertplay.airplay
 
 import android.util.Log
+import com.shilapi.xcertplay.orchestration.CarPlayLinkEnd
+import com.shilapi.xcertplay.orchestration.CarPlayLinkDiagnostics
 import java.io.Closeable
 import java.io.DataInputStream
 import java.math.BigInteger
@@ -33,6 +35,8 @@ internal class BufferedAudioStream(
     internal class Frame(val sequence: Int, val timestamp: Long, val rtp: ByteArray)
 
     private val id = AudioStreamId(format.payloadType, format.audioType)
+    internal var onLinkEnded: (CarPlayLinkEnd) -> Unit = {}
+    private val linkEnd = CarPlayLinkDiagnostics("stream_audio", { onLinkEnded(it) })
     private val closed = AtomicBoolean(false)
     private val started = AtomicBoolean(false)
     private var cleanupStarted = false // guarded by lock; permits reentrant close without recursion
@@ -78,6 +82,7 @@ internal class BufferedAudioStream(
         try {
             val socket = acceptPeer() ?: return
             accepted = socket
+            linkEnd.reached = "tcp_accepted"
             // One stream has one TCP sender. Release the listening socket after ownership is set.
             server.close()
             log("Buffered audio: connected")
@@ -88,12 +93,15 @@ internal class BufferedAudioStream(
             while (!closed.get()) {
                 val length = input.readUnsignedShort()
                 if (length < LENGTH_BYTES + RTP_HEADER + TAG_BYTES + NONCE_BYTES) {
+                    linkEnd.end("peer", "protocol_error", "invalid buffered audio frame length", counters = true)
                     log("Buffered audio: invalid frame length $length; closed")
                     close()
                     return
                 }
                 val body = ByteArray(length - LENGTH_BYTES)
                 input.readFully(body)
+                linkEnd.received(length)
+                linkEnd.reached = "receiving"
                 val frame = open(key, body)
                 if (frame == null) {
                     if (failures++ < 3) log("Buffered audio: frame did not open (${body.size} bytes)")
@@ -134,6 +142,7 @@ internal class BufferedAudioStream(
                 if (pacing) pause(pacedFrameMillis)
             }
         } catch (error: Exception) {
+            if (!closed.get()) linkEnd.failed(error, counters = true)
             if (!closed.get()) log("Buffered audio: connection ended (${error.javaClass.simpleName})")
         } finally {
             runCatching { accepted?.close() }
@@ -150,6 +159,8 @@ internal class BufferedAudioStream(
                     return null
                 }
                 if (socket.inetAddress != expectedPeer) {
+                    runCatching { onLinkEnded(CarPlayLinkEnd("stream_audio", "tcp_accepted", "local", "protocol_error",
+                        "sender_outside_control_session", ageMillis = 0, facts = mapOf("type" to "103", "bytes" to "0", "packets" to "0"))) }
                     runCatching { socket.close() }
                     log("Buffered audio: rejected sender outside the control session")
                     false
@@ -195,6 +206,7 @@ internal class BufferedAudioStream(
             }
         } catch (_: InterruptedException) {
         } catch (error: Exception) {
+            if (!closed.get()) linkEnd.failed(error, counters = true)
             if (!closed.get()) Log.w(TAG, "buffered audio feed failed", error)
             close()
         }
@@ -304,7 +316,13 @@ internal class BufferedAudioStream(
         fedSamples = 0
     }
 
+    internal fun close(cause: String) {
+        linkEnd.end(cause = cause, counters = true)
+        close()
+    }
+
     override fun close() {
+        linkEnd.end(counters = true)
         closed.set(true)
         runCatching { server.close() }
         synchronized(lock) {

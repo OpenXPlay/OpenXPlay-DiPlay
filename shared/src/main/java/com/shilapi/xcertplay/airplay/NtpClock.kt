@@ -1,5 +1,7 @@
 package com.shilapi.xcertplay.airplay
 
+import com.shilapi.xcertplay.orchestration.CarPlayLinkEnd
+import com.shilapi.xcertplay.orchestration.CarPlayLinkDiagnostics
 import java.io.Closeable
 import java.math.BigInteger
 import java.net.DatagramPacket
@@ -17,6 +19,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  * the phone's media-clock domain, which /feedback reports.
  */
 class NtpClock : Closeable {
+    internal var onLinkEnded: (CarPlayLinkEnd) -> Unit = {}
+    private var linkEnd: CarPlayLinkDiagnostics? = null
     private val running = AtomicBoolean(false)
     private val socketLock = Any()
     private val clockLock = Any()
@@ -37,9 +41,18 @@ class NtpClock : Closeable {
 
     fun listen(): Int {
         check(!running.getAndSet(true)) { "NtpClock is already running" }
-        val bound = DatagramSocket(null)
-        bound.reuseAddress = true
-        bound.bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+        linkEnd = CarPlayLinkDiagnostics("stream_other", { onLinkEnded(it.copy(facts = it.facts + ("channel" to "timing"))) })
+        val bound = try { DatagramSocket(null) } catch (error: Exception) {
+            linkEnd?.failed(error, counters = true)
+            throw error
+        }
+        try {
+            bound.reuseAddress = true
+            bound.bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+        } catch (error: Exception) {
+            linkEnd?.failed(error, counters = true)
+            throw error
+        }
         synchronized(socketLock) { socket = bound }
         receiver = Thread(::runReceiver, "airplay-ntp-rx").apply { isDaemon = true; start() }
         return bound.localPort
@@ -57,6 +70,7 @@ class NtpClock : Closeable {
     }
 
     override fun close() {
+        linkEnd?.end(counters = true)
         running.set(false)
         synchronized(socketLock) {
             socket?.close()
@@ -105,6 +119,8 @@ class NtpClock : Closeable {
             } catch (_: Exception) {
                 if (running.get()) continue else return
             }
+            linkEnd?.received(packet.length)
+            linkEnd?.reached = "receiving"
             val message = packet.data.copyOf(packet.length)
             val address = packet.address
             if (message.size >= NTP_PACKET_BYTES && address != null) {

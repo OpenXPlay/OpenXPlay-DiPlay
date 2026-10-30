@@ -1,5 +1,7 @@
 package com.shilapi.xcertplay.airplay
 
+import com.shilapi.xcertplay.orchestration.CarPlayLinkEnd
+import com.shilapi.xcertplay.orchestration.CarPlayLinkDiagnostics
 import java.io.Closeable
 import java.io.InputStream
 import java.net.Inet4Address
@@ -29,6 +31,10 @@ class IapTunnel(
         fun onClosed(cause: Throwable?) {}
     }
 
+    internal var onLinkEnded: (CarPlayLinkEnd) -> Unit = {}
+    private val listenerEnd = CarPlayLinkDiagnostics("stream_other", { onLinkEnded(it) })
+    private val acceptedAny = AtomicBoolean(false)
+    private val linkEnds = java.util.concurrent.ConcurrentHashMap<Socket, CarPlayLinkDiagnostics>()
     private val closed = AtomicBoolean(false)
     private val readCounter = AtomicLong(0)
     private val bindAddress =
@@ -41,7 +47,10 @@ class IapTunnel(
 
     fun listen(listener: Listener): Int {
         this.listener = listener
-        val bound = bindAny()
+        val bound = try { bindAny() } catch (error: Exception) {
+            listenerEnd.failed(error, counters = true)
+            throw error
+        }
         servers += bound
         listener.onDebug("AirPlay iAP tunnel listener bound=${bound.localSocketAddress}")
         val secondaryAddress = if (bindAddress is java.net.Inet6Address) {
@@ -49,7 +58,10 @@ class IapTunnel(
         } else {
             InetAddress.getByName("::")
         }
-        val secondary = ServerSocket()
+        val secondary = try { ServerSocket() } catch (error: Exception) {
+            listenerEnd.failed(error, counters = true)
+            throw error
+        }
         runCatching {
             secondary.apply {
                 reuseAddress = true
@@ -83,8 +95,16 @@ class IapTunnel(
             bind(InetSocketAddress(bindAddress, 0))
         }
 
+    internal fun close(cause: String) {
+        if (!acceptedAny.get()) listenerEnd.end(cause = cause, counters = true)
+        linkEnds.values.forEach { it.end(cause = cause, counters = true) }
+        close()
+    }
+
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
+        if (!acceptedAny.get()) listenerEnd.end(counters = true)
+        linkEnds.values.forEach { it.end(counters = true) }
         safeClose(socket)
         servers.toList().forEach(::safeClose)
         servers.clear()
@@ -112,23 +132,30 @@ class IapTunnel(
             val accepted = try {
                 bound.accept()
             } catch (error: Exception) {
-                if (!closed.get()) listener.onClosed(error)
+                if (!closed.get()) { listenerEnd.failed(error, counters = true); listener.onClosed(error) }
                 return
             }
             if (closed.get()) {
                 safeClose(accepted)
                 return
             }
-            accepted.setSoLinger(true, 0)
+            val end = if (acceptedAny.compareAndSet(false, true)) listenerEnd
+                else CarPlayLinkDiagnostics("stream_other", { onLinkEnded(it) })
+            try { accepted.setSoLinger(true, 0) } catch (error: Exception) {
+                end.failed(error, counters = true)
+                throw error
+            }
+            linkEnds[accepted] = end
             socket = accepted
+            end.reached = "tcp_accepted"
             readCounter.set(0)
             peerConnected.countDown()
             listener.onOpen(accepted.remoteSocketAddress?.toString())
-            run(accepted)
+            run(accepted, end)
         }
     }
 
-    private fun run(sock: Socket) {
+    private fun run(sock: Socket, linkEnd: CarPlayLinkDiagnostics) {
         var ciphertext = ByteArray(0)
         var plaintext = ByteArray(0)
         var failure: Throwable? = null
@@ -146,6 +173,8 @@ class IapTunnel(
                     announcedData = true
                     listener.onDebug("AirPlay iAP tunnel received data")
                 }
+                linkEnd.received(read)
+                linkEnd.reached = "receiving"
                 ciphertext += buffer.copyOf(read)
                 val decrypted = decryptFrames(ciphertext)
                 plaintext += decrypted.first
@@ -154,7 +183,10 @@ class IapTunnel(
             }
         } catch (error: Exception) {
             failure = error
+            if (!closed.get()) linkEnd.failed(error, counters = true)
         } finally {
+            if (!closed.get()) linkEnd.end("peer", "peer_eof", counters = true)
+            linkEnds.remove(sock)
             if (socket === sock) socket = null
             safeClose(sock)
             if (!closed.get() && failure != null) listener.onClosed(failure)

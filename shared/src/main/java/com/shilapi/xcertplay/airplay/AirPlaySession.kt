@@ -4,6 +4,8 @@
 package com.shilapi.xcertplay.airplay
 
 import android.util.Log
+import com.shilapi.xcertplay.orchestration.CarPlayLinkEnd
+import com.shilapi.xcertplay.orchestration.CarPlayLinkDiagnostics
 import com.shilapi.xcertplay.mfi.MfiAuthenticator
 import com.shilapi.xcertplay.transport.BlockingDuplexByteStream
 import java.io.BufferedInputStream
@@ -30,6 +32,7 @@ data class AirPlayDeviceInfo(
 interface AirPlaySessionListener {
     fun onStartupMilestone(session: AirPlaySession, name: String) {}
     fun onTcpAccepted(event: AirPlayTcpAccepted) {}
+    fun onLinkEnded(end: CarPlayLinkEnd) {}
     fun onSessionActive(session: AirPlaySession) {}
     fun onSessionEnded(session: AirPlaySession) {}
     fun onVideoFrameRendered(session: AirPlaySession) {}
@@ -93,6 +96,17 @@ class AirPlaySession(
     private var clusterStreamSetups = 0
     @Volatile private var mainScreenToken: Any? = null
 
+    internal var connectionNumber = 1
+    @Volatile private var requests = 0L
+    @Volatile private var lastRequest = "none"
+    @Volatile private var lastStatus = 0
+    @Volatile private var lastRxNs = 0L
+    @Volatile private var lastTxNs = 0L
+    @Volatile private var setupSeen = false
+    @Volatile private var recordSeen = false
+    private val controlEnd = CarPlayLinkDiagnostics("airplay_control", ::reportLinkEnd)
+    private var eventEnd: CarPlayLinkDiagnostics? = null
+    private var keepAliveEnd: CarPlayLinkDiagnostics? = null
     private val closed = AtomicBoolean(false)
     internal val isClosed: Boolean get() = closed.get()
     private val notified = AtomicBoolean(false)
@@ -131,7 +145,21 @@ class AirPlaySession(
 
     internal fun logDebug(message: String) = debugLog(message)
 
+    internal fun reportLinkEnd(end: CarPlayLinkEnd) {
+        runCatching { listener.onLinkEnded(end) }
+    }
+
+    private fun controlFacts(): Map<String, String> {
+        fun ago(time: Long) = if (time == 0L) "-1" else "${((System.nanoTime() - time) / 1_000_000).coerceAtLeast(0)}"
+        return linkedMapOf("connection" to "$connectionNumber", "requests" to "$requests",
+            "lastRequest" to lastRequest, "lastStatus" to "$lastStatus", "rxAgoMs" to ago(lastRxNs),
+            "txAgoMs" to ago(lastTxNs), "pairSetup" to "${pairSetup.complete}", "pairVerified" to "${cipher != null}",
+            "verifyOnly" to "${cipher != null && !setupSeen}", "record" to "$recordSeen",
+            "streams" to runCatching { activeStreams.joinToString(",").ifEmpty { "none" } }.getOrDefault("unknown"))
+    }
+
     internal fun startupMilestone(name: String) {
+        controlEnd.reached = name
         runCatching { listener.onStartupMilestone(this, name) }
     }
 
@@ -150,6 +178,7 @@ class AirPlaySession(
 
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
+        controlEnd.end(facts = controlFacts())
         mainScreenToken = null
         clearClusterContent()
         safeClose(socket)
@@ -335,6 +364,7 @@ class AirPlaySession(
             output.flush()
             true
         } catch (error: Exception) {
+            eventEnd?.failed(error, counters = true)
             Log.w(TAG, "airplay event command failed type=${command["type"]}", error)
             close()
             false
@@ -444,19 +474,27 @@ class AirPlaySession(
         )
 
     private fun runControl() {
-        com.shilapi.xcertplay.network.TcpLiveness.configure(socket) { debugLog(it) }
-        val input = BufferedInputStream(socket.getInputStream())
-        val output = BufferedOutputStream(socket.getOutputStream())
         var accumulated = ByteArray(0)
         val buffer = ByteArray(READ_CHUNK_BYTES)
         var closeReason = "session closed"
+        var healthLimit = "unavailable"
         try {
+            com.shilapi.xcertplay.network.TcpLiveness.configure(socket) {
+                if (it.startsWith("TCP peer health enabled")) healthLimit = "20000"
+                debugLog(it)
+            }
+            val input = BufferedInputStream(socket.getInputStream())
+            val output = BufferedOutputStream(socket.getOutputStream())
+            controlEnd.reached = "tcp_accepted"
             while (!closed.get()) {
                 val count = input.read(buffer)
                 if (count < 0) {
                     closeReason = "peer EOF"
+                    if (!closed.get()) controlEnd.end("peer", "peer_eof", facts = controlFacts())
                     break
                 }
+                lastRxNs = System.nanoTime()
+                controlEnd.received(count)
                 var plaintext = buffer.copyOf(count)
                 val activeCipher = cipher
                 if (activeCipher != null) {
@@ -464,7 +502,9 @@ class AirPlaySession(
                     val decrypted = try {
                         activeCipher.decrypt(encBuf)
                     } catch (error: Exception) {
-                        closeReason = "control decrypt failed: ${error.message ?: error.javaClass.simpleName}"
+                        closeReason = "control decrypt failed"
+                        if (!closed.get()) controlEnd.end("local", "decrypt_failed",
+                            CarPlayLinkDiagnostics.failureDetail(error), controlFacts())
                         Log.e(TAG, "airplay $closeReason encrypted=${encBuf.size}", error)
                         break
                     }
@@ -475,6 +515,9 @@ class AirPlaySession(
                 val parsed = RtspMessage.parseMessages(accumulated)
                 accumulated = parsed.rest
                 for (request in parsed.messages) {
+                    requests++
+                    lastRequest = AirPlayControlDiagnostics.route(request.method, request.path)
+                    if (request.method == "SETUP") setupSeen = true
                     val cseq = request.headers["cseq"] ?: "-"
                     val path = request.path.lowercase()
                     val showInDebugOverlay =
@@ -510,6 +553,7 @@ class AirPlaySession(
                         "airplay control response status=${response.status ?: 200} contentBytes=${response.body.size}",
                         false,
                     )
+                    lastStatus = response.status ?: 200
                     val wire = RtspMessage.buildResponse(request, response)
                     trace("airplay control tx wireHex=${wire.toHex()}")
                     output.write(cipher?.encrypt(wire) ?: wire)
@@ -521,19 +565,27 @@ class AirPlaySession(
                     }
                 }
                 output.flush()
+                lastTxNs = System.nanoTime()
                 notifySetupResponseSent()
             }
         } catch (error: Exception) {
-            closeReason = "control I/O failed: ${error.message ?: error.javaClass.simpleName}"
+            closeReason = "control I/O failed"
+            if (!closed.get()) {
+                if (CarPlayLinkDiagnostics.failureCause(error) == "health_timeout") controlEnd.end("timeout", "health_timeout",
+                    "tcp_peer_health limitMs=$healthLimit; ${CarPlayLinkDiagnostics.failureDetail(error)}", controlFacts())
+                else controlEnd.failed(error, controlFacts())
+            }
             if (!closed.get()) Log.e(TAG, "airplay $closeReason", error)
         } finally {
+            controlEnd.end(facts = controlFacts())
             startupMilestone(when {
                 closed.get() -> "transport_closed_local"
                 closeReason == "peer EOF" -> "transport_closed_peer_eof"
                 closeReason.startsWith("control decrypt failed") -> "transport_closed_decrypt_failed"
                 else -> "transport_closed_io_failed"
             })
-            debugLog("airplay control closing reason=$closeReason activeStreams=$activeStreams")
+            debugLog("airplay control closing reason=$closeReason " +
+                controlFacts().entries.joinToString(" ") { (key, value) -> "$key=$value" })
             close()
         }
     }
@@ -551,6 +603,8 @@ class AirPlaySession(
                 return RtspMessage.Response(status = 200)
             }
             "RECORD" -> {
+                recordSeen = true
+                controlEnd.reached = "session_active"
                 listener.onSessionActive(this)
                 return RtspMessage.Response(status = 200)
             }
@@ -824,15 +878,25 @@ class AirPlaySession(
     }
 
     private fun openTiming(peerPort: Int): Int {
+        ntp.onLinkEnded = ::reportLinkEnd
         val port = ntp.listen()
         if (peerPort > 0) peerAddress?.let { ntp.start(it, peerPort) }
         return port
     }
 
     private fun openKeepAlive(): Int {
-        val socket = DatagramSocket(null)
-        socket.reuseAddress = true
-        socket.bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+        keepAliveEnd = CarPlayLinkDiagnostics("stream_other", { reportLinkEnd(it.copy(facts = it.facts + ("channel" to "keepalive"))) })
+        val socket = try { DatagramSocket(null) } catch (error: Exception) {
+            keepAliveEnd?.failed(error, counters = true)
+            throw error
+        }
+        try {
+            socket.reuseAddress = true
+            socket.bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+        } catch (error: Exception) {
+            keepAliveEnd?.failed(error, counters = true)
+            throw error
+        }
         keepAliveSocket = socket
         keepAliveThread = Thread({ runKeepAlive(socket) }, "airplay-keepalive").apply {
             isDaemon = true
@@ -845,7 +909,10 @@ class AirPlaySession(
         val buffer = ByteArray(512)
         while (!closed.get()) {
             try {
-                socket.receive(DatagramPacket(buffer, buffer.size))
+                val packet = DatagramPacket(buffer, buffer.size)
+                socket.receive(packet)
+                keepAliveEnd?.received(packet.length)
+                keepAliveEnd?.reached = "receiving"
             } catch (_: Exception) {
                 if (closed.get()) return
             }
@@ -853,9 +920,15 @@ class AirPlaySession(
     }
 
     private fun openEvent(): Int {
-        val server = ServerSocket(0, 50, InetAddress.getByName("::"))
+        eventEnd?.end(cause = "replaced", counters = true)
+        val end = CarPlayLinkDiagnostics("airplay_event", ::reportLinkEnd)
+        eventEnd = end
+        val server = try { ServerSocket(0, 50, InetAddress.getByName("::")) } catch (error: Exception) {
+            end.failed(error, counters = true)
+            throw error
+        }
         eventServer = server
-        spawnEvent("airplay-event-accept") { acceptEvent(server) }
+        spawnEvent("airplay-event-accept") { acceptEvent(server, end) }
         return server.localPort
     }
 
@@ -863,10 +936,12 @@ class AirPlaySession(
         videoPlaybackAvailability.setEventReady(false)
         videoPlaybackAvailability.setFeatureEnabled(false)
         ntp.close()
+        keepAliveEnd?.end(counters = true)
         safeClose(keepAliveSocket)
         keepAliveSocket = null
         keepAliveThread?.interrupt()
         keepAliveThread = null
+        eventEnd?.end(counters = true)
         safeClose(eventServer)
         eventServer = null
         safeClose(eventSocket)
@@ -876,7 +951,7 @@ class AirPlaySession(
         eventThreads.clear()
     }
 
-    private fun acceptEvent(server: ServerSocket) {
+    private fun acceptEvent(server: ServerSocket, end: CarPlayLinkDiagnostics) {
         try {
             val socket = server.accept()
             socket.setSoLinger(true, 0)
@@ -885,8 +960,10 @@ class AirPlaySession(
             socket.tcpNoDelay = true
             debugLog("airplay event connection accepted from ${socket.remoteSocketAddress} noDelay=${socket.tcpNoDelay}")
             eventSocket = socket
+            end.reached = "tcp_accepted"
             val shared = pairVerify.shared
             if (shared == null) {
+                end.end("local", "protocol_error", "pair-verify unavailable", counters = true)
                 Log.e(TAG, "airplay event rejected: pair-verify shared secret unavailable")
                 safeClose(socket)
                 close()
@@ -911,16 +988,17 @@ class AirPlaySession(
             val videoDelivery = videoPlaybackAvailability.setEventReady(true)
             debugLog("airplay video event ready availability=$videoDelivery")
             reapplyClusterContent()
-            runEventRead(socket)
+            runEventRead(socket, end)
         } catch (error: Exception) {
             if (!closed.get()) {
+                end.failed(error, counters = true)
                 Log.e(TAG, "airplay event accept failed", error)
                 close()
             }
         }
     }
 
-    private fun runEventRead(socket: Socket) {
+    private fun runEventRead(socket: Socket, end: CarPlayLinkDiagnostics) {
         try {
             val input = BufferedInputStream(socket.getInputStream())
             val output = BufferedOutputStream(socket.getOutputStream())
@@ -929,12 +1007,18 @@ class AirPlaySession(
             val buffer = ByteArray(READ_CHUNK_BYTES)
             while (!closed.get()) {
                 val count = input.read(buffer)
-                if (count < 0) break
+                if (count < 0) {
+                    if (!closed.get()) end.end("peer", "peer_eof", counters = true)
+                    break
+                }
+                end.received(count)
                 val cipher = eventCipher ?: break
                 encrypted += buffer.copyOf(count)
                 val decrypted = try {
                     cipher.decrypt(encrypted)
                 } catch (error: Exception) {
+                    if (!closed.get()) end.end("local", "decrypt_failed",
+                        CarPlayLinkDiagnostics.failureDetail(error), counters = true)
                     Log.e(TAG, "airplay event decrypt failed encrypted=${encrypted.size}", error)
                     break
                 }
@@ -960,7 +1044,10 @@ class AirPlaySession(
                 }
             }
         } catch (error: Exception) {
-            if (!closed.get()) Log.e(TAG, "airplay event read failed", error)
+            if (!closed.get()) {
+                end.failed(error, counters = true)
+                Log.e(TAG, "airplay event read failed", error)
+            }
         } finally {
             debugLog("airplay event connection closed")
             videoPlaybackAvailability.setEventReady(false)

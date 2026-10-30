@@ -1,6 +1,8 @@
 package com.shilapi.xcertplay.transport
 
 import android.bluetooth.BluetoothSocket
+import com.shilapi.xcertplay.orchestration.CarPlayLinkEnd
+import com.shilapi.xcertplay.orchestration.CarPlayLinkDiagnostics
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
@@ -32,16 +34,21 @@ class BluetoothRfcommStreamException internal constructor(
 class BluetoothRfcommDuplexStream internal constructor(
     private val socket: BluetoothRfcommSocketAccess,
     private val onDiagnostic: (String) -> Unit = {},
+    onLinkEnded: (CarPlayLinkEnd) -> Unit = {},
 ) : BlockingDuplexByteStream {
-    constructor(socket: BluetoothSocket, onDiagnostic: (String) -> Unit = {}) : this(
+    constructor(socket: BluetoothSocket, onDiagnostic: (String) -> Unit = {}) : this(socket, onDiagnostic, {})
+
+    internal constructor(socket: BluetoothSocket, onDiagnostic: (String) -> Unit, onLinkEnded: (CarPlayLinkEnd) -> Unit) : this(
         object : BluetoothRfcommSocketAccess {
             override fun inputStream(): InputStream? = socket.inputStream
             override fun outputStream(): OutputStream? = socket.outputStream
             override fun close() = socket.close()
         },
         onDiagnostic,
+        onLinkEnded,
     )
 
+    private val linkEnd = CarPlayLinkDiagnostics("bluetooth", onLinkEnded).apply { reached = "rfcomm_connected" }
     private val lock = Object()
     private val sendLock = Object()
     private val pending = ArrayDeque<ByteArray>()
@@ -145,6 +152,7 @@ class BluetoothRfcommDuplexStream internal constructor(
         }
         if (!firstClose) return
 
+        linkEnd.end()
         var closeFailure = closeSocketOnce()
         if (Thread.currentThread() !== reader) {
             try {
@@ -182,7 +190,10 @@ class BluetoothRfcommDuplexStream internal constructor(
                 readCalls++
                 when (val count = input.read(buffer)) {
                     -1 -> {
-                        if (!isStopping()) reportReadTerminal("ENDED")
+                        if (!isStopping()) {
+                            linkEnd.end("peer", "peer_eof")
+                            reportReadTerminal("ENDED")
+                        }
                         synchronized(lock) {
                             peerEnded = true
                             lock.notifyAll()
@@ -193,6 +204,7 @@ class BluetoothRfcommDuplexStream internal constructor(
                     0 -> Unit
                     else -> synchronized(lock) {
                         if (closed) return
+                        linkEnd.received(count)
                         receivedBytes += count
                         pending.addLast(if (count == buffer.size) buffer else buffer.copyOf(count))
                         pendingBytes += count
@@ -255,6 +267,7 @@ class BluetoothRfcommDuplexStream internal constructor(
             failure = io
             lock.notifyAll()
         }
+        linkEnd.failed(io)
         reportFailure(io)
         closeSocketOnce()?.let { if (it !== io) io.addSuppressed(it) }
         return io
@@ -271,6 +284,7 @@ class BluetoothRfcommDuplexStream internal constructor(
         } catch (error: Throwable) {
             val failure = if (error is BluetoothRfcommStreamException) error else
                 BluetoothRfcommStreamException(operation, BluetoothRfcommStreamException.Reason.STREAM_ACCESS_FAILED, error)
+            linkEnd.failed(failure)
             reportFailure(failure)
             closeSocketOnce()?.let(failure::addSuppressed)
             if (error is Error) throw error

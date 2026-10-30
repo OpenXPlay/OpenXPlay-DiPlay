@@ -156,7 +156,9 @@ class CarPlayMediaEngine(
         val key = outputKey(session, stream) ?: return null
         val streamKey = StreamKey(session, type)
         Log.i(TAG, "airplay screen key connectionID=${unsignedPlistDecimal(stream["streamConnectionID"])}")
-        val screen = ScreenStream(key, session::logDebug)
+        val screen = ScreenStream(key, session::logDebug).apply {
+            onLinkEnded = { session.reportLinkEnd(it.copy(facts = it.facts + ("type" to "$type"))) }
+        }
         val output = ScreenOutput(streamKey, screen)
         val port = screen.listen(
             object : ScreenStream.Listener by currentScreenListener(type, sink,
@@ -205,7 +207,7 @@ class CarPlayMediaEngine(
                     // A non-isolated older session may already have another stream for this key.
                     screenOutputs[streamKey]?.takeIf { it !== previous }?.let { old ->
                         forgetScreen(old)
-                        old.stream.close()
+                        old.stream.close("replaced")
                     }
                     screenOwners[type] = output
                     screenOutputs[streamKey] = output
@@ -239,7 +241,7 @@ class CarPlayMediaEngine(
         } finally {
             // Closing a socket can wake callbacks; ownership has already changed before it does.
             previous?.takeIf { screenSessionPolicy.isolateSessions || screenSessionPolicy.resetOnReconnect || it.key == streamKey }
-                ?.stream?.close()
+                ?.stream?.close("replaced")
         }
     }
 
@@ -277,7 +279,7 @@ class CarPlayMediaEngine(
         // type 100); only the same (type, audioType) pair replaces a previous stream.
         val streamKey = StreamKey(session, type, audioType)
         val streamId = AudioStreamId(type, audioType)
-        streams.remove(streamKey)?.close()
+        streams.remove(streamKey)?.let(::closeReplacedStream)
         audioMeta.remove(streamKey)
         audioCaptures.remove(streamKey)?.close()
         if (pendingMicrophone.remove(streamKey) != null) sink.onMicrophoneStopped(streamId)
@@ -315,7 +317,7 @@ class CarPlayMediaEngine(
         if (capture != null) audioCaptures[streamKey] = capture
         val clockProbe = RtpClockProbe()
         val microphoneStart = microphone?.let { config -> MicrophoneStart { sink.onMicrophoneStarted(streamId, config) } }
-        val audio = AudioStream(key, type, session::logDebug)
+        val audio = AudioStream(key, type, session::logDebug).apply { onLinkEnded = session::reportLinkEnd }
         val (dataPort, controlPort) = audio.listen(
             object : AudioStream.Listener {
                 override fun onStarted(firstSample: Int) {
@@ -394,8 +396,12 @@ class CarPlayMediaEngine(
         }
         val peer = session.remoteAddress ?: return null
         val buffered = try {
-            BufferedAudioStream(key, format, sink, session::logDebug, expectedPeer = peer)
+            BufferedAudioStream(key, format, sink, session::logDebug, expectedPeer = peer).apply {
+                onLinkEnded = { session.reportLinkEnd(it.copy(facts = it.facts + ("type" to "103"))) }
+            }
         } catch (error: Exception) {
+            session.reportLinkEnd(com.shilapi.xcertplay.orchestration.CarPlayLinkEnd("stream_audio", "opening", "local", "connect_failed",
+                com.shilapi.xcertplay.orchestration.CarPlayLinkDiagnostics.failureDetail(error), facts = mapOf("type" to "103")))
             Log.w(TAG, "buffered audio listener failed", error)
             return null
         }
@@ -419,7 +425,7 @@ class CarPlayMediaEngine(
             buffered.close()
             return null
         }
-        val retired = runCatching { previous?.stream?.close() }.isSuccess &&
+        val retired = runCatching { previous?.stream?.close("replaced") }.isSuccess &&
             previous?.stream?.outputCleanupComplete != false
         val installed = synchronized(bufferedOwnershipLock) {
             val usable = retired && bufferedTransition === transition && !transition.cancelled &&
@@ -498,6 +504,7 @@ class CarPlayMediaEngine(
                     else -> InetAddress.getByName("0.0.0.0")
                 },
         )
+        tunnel.onLinkEnded = { session.reportLinkEnd(it.copy(facts = it.facts + ("type" to "130"))) }
         val bridge = AirPlayIapTunnelStream(session, tunnel)
         val handler = iapTunnelHandler
         val port = try {
@@ -554,8 +561,9 @@ class CarPlayMediaEngine(
             shared, "DataStream-Salt$seed".toByteArray(Charsets.US_ASCII), label.toByteArray(Charsets.US_ASCII), 32,
         )
         val channel = VideoSettingsChannel(key(DATASTREAM_OUTPUT_KEY), key(DATASTREAM_INPUT_KEY)) { session.logDebug(it) }
+        channel.onLinkEnded = { session.reportLinkEnd(it.copy(facts = it.facts + mapOf("type" to "130", "channel" to "video_settings"))) }
         val port = channel.listen(session.localAddress ?: InetAddress.getByName("::"))
-        videoSettingsChannels.put(session, channel)?.close()
+        videoSettingsChannels.put(session, channel)?.close("replaced")
         session.logTrace("video settings stream listening port=$port")
         return linkedMapOf<String, Any?>("type" to STREAM_TYPE_DATA, "streamID" to VIDEO_SETTINGS_STREAM_ID, "dataPort" to port)
             .apply {
@@ -692,7 +700,7 @@ class CarPlayMediaEngine(
         }
         try {
             pending?.stream?.close()
-            previous?.stream?.close()
+            previous?.stream?.close("replaced")
         } finally {
             synchronized(bufferedOwnershipLock) {
                 if (retirement != null && bufferedTransition === retirement &&
@@ -701,9 +709,19 @@ class CarPlayMediaEngine(
         }
     }
 
+    private fun closeReplacedStream(stream: Closeable) {
+        when (stream) {
+            is AudioStream -> stream.close("replaced")
+            is ScreenStream -> stream.close("replaced")
+            is AirPlayIapTunnelStream -> stream.close("replaced")
+            is IapTunnel -> stream.close("replaced")
+            else -> stream.close()
+        }
+    }
+
     private fun replacePendingIapTunnel(session: AirPlaySession, next: PendingIapTunnel) {
         val previous = pendingIapTunnels.put(session, next)
-        previous?.bridge?.close()
+        previous?.bridge?.close("replaced")
     }
 
     private fun clearPendingIapTunnel(session: AirPlaySession? = null) {

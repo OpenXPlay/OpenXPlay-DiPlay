@@ -22,6 +22,9 @@ interface CarPlayEventObserver {
     /** Safe, fixed protocol milestones, never pairing payloads or credentials. */
     fun onStartupMilestone(name: String) {}
 
+    /** One link of the connection ended or failed to open; any thread, at most once per link instance. */
+    fun onLinkEnded(end: CarPlayLinkEnd) {}
+
     /** A CarPlay session started recording; may repeat for the same session. */
     fun onSessionActive() {}
 

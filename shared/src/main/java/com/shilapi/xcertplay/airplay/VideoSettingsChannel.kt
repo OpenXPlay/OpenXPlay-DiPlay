@@ -1,5 +1,7 @@
 package com.shilapi.xcertplay.airplay
 
+import com.shilapi.xcertplay.orchestration.CarPlayLinkEnd
+import com.shilapi.xcertplay.orchestration.CarPlayLinkDiagnostics
 import java.io.Closeable
 import java.io.OutputStream
 import java.net.InetAddress
@@ -21,6 +23,8 @@ class VideoSettingsChannel(
     private val writeKey: ByteArray,
     private val log: (String) -> Unit,
 ) : Closeable {
+    internal var onLinkEnded: (CarPlayLinkEnd) -> Unit = {}
+    private val linkEnd = CarPlayLinkDiagnostics("stream_other", { onLinkEnded(it) })
     private val closed = AtomicBoolean(false)
     private var server: ServerSocket? = null
     private var socket: Socket? = null
@@ -28,10 +32,11 @@ class VideoSettingsChannel(
     private var writeCounter = 0L
 
     fun listen(bindAddress: InetAddress): Int {
-        val bound = ServerSocket().apply {
+        val bound = try { ServerSocket().apply {
             reuseAddress = true
             bind(InetSocketAddress(bindAddress, 0))
         }
+        } catch (error: Exception) { linkEnd.failed(error, counters = true); throw error }
         server = bound
         Thread({ accept(bound) }, "diplay-video-settings").apply { isDaemon = true }.start()
         return bound.localPort
@@ -41,9 +46,12 @@ class VideoSettingsChannel(
         try {
             val accepted = bound.accept()
             socket = accepted
+            linkEnd.reached = "tcp_accepted"
             log("video settings channel connected")
             run(accepted)
+            if (!closed.get()) linkEnd.end("peer", "peer_eof", counters = true)
         } catch (error: Exception) {
+            if (!closed.get()) linkEnd.failed(error, counters = true)
             if (!closed.get()) log("video settings channel ended: ${error.message}")
         } finally {
             close()
@@ -59,6 +67,8 @@ class VideoSettingsChannel(
         while (!closed.get()) {
             val read = input.read(buffer)
             if (read < 0) return
+            linkEnd.received(read)
+            linkEnd.reached = "receiving"
             ciphertext += buffer.copyOf(read)
             var offset = 0
             while (ciphertext.size - offset >= 2) {
@@ -99,8 +109,14 @@ class VideoSettingsChannel(
         output.flush()
     }
 
+    internal fun close(cause: String) {
+        linkEnd.end(cause = cause, counters = true)
+        close()
+    }
+
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
+        linkEnd.end(counters = true)
         runCatching { socket?.close() }
         runCatching { server?.close() }
     }

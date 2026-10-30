@@ -57,14 +57,15 @@ internal class AirPlayIapTunnelStream(
             if (closed) throw closedFailureLocked()
         }
         if (!tunnel.awaitPeerConnection(PEER_CONNECT_TIMEOUT_MILLIS)) {
-            throw IOException("CarPlay iAP tunnel peer did not connect")
+            throw IOException("CarPlay iAP tunnel peer did not connect; iap_tunnel_peer limitMs=$PEER_CONNECT_TIMEOUT_MILLIS")
         }
         synchronized(lock) {
             throwTerminalFailureLocked()
             if (closed) throw closedFailureLocked()
         }
         if (!sendCommand(data, EVENT_READY_TIMEOUT_MILLIS)) {
-            throw IOException("AirPlay event channel rejected an iAP message")
+            throw IOException("AirPlay event channel rejected an iAP message" +
+                if (session.isClosed) "" else "; iap_event_ready limitMs=$EVENT_READY_TIMEOUT_MILLIS")
         }
     }
 
@@ -91,6 +92,11 @@ internal class AirPlayIapTunnelStream(
                 }
             }
         }
+    }
+
+    internal fun close(cause: String) {
+        tunnel.close(cause)
+        close()
     }
 
     override fun close() {

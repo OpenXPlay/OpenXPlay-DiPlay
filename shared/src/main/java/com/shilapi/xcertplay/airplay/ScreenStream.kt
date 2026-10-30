@@ -1,6 +1,8 @@
 package com.shilapi.xcertplay.airplay
 
 import android.util.Log
+import com.shilapi.xcertplay.orchestration.CarPlayLinkEnd
+import com.shilapi.xcertplay.orchestration.CarPlayLinkDiagnostics
 import java.io.Closeable
 import java.io.InputStream
 import java.net.InetAddress
@@ -32,6 +34,8 @@ class ScreenStream(private val key: ByteArray, private val onDiagnostic: (String
         fun onClosed(cause: Throwable?) {}
     }
 
+    internal var onLinkEnded: (CarPlayLinkEnd) -> Unit = {}
+    private val linkEnd = CarPlayLinkDiagnostics("stream_video", { onLinkEnded(it) })
     private val closed = AtomicBoolean(false)
     private val frameCounter = AtomicLong(0)
     private val firstFrameLogged = AtomicBoolean(false)
@@ -42,16 +46,30 @@ class ScreenStream(private val key: ByteArray, private val onDiagnostic: (String
 
     fun listen(listener: Listener): Int {
         this.listener = listener
-        val bound = ServerSocket()
-        bound.reuseAddress = true
-        bound.bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+        val bound = try { ServerSocket() } catch (error: Exception) {
+            linkEnd.failed(error, counters = true)
+            throw error
+        }
+        try {
+            bound.reuseAddress = true
+            bound.bind(InetSocketAddress(InetAddress.getByName("::"), 0))
+        } catch (error: Exception) {
+            linkEnd.failed(error, counters = true)
+            throw error
+        }
         server = bound
         thread = Thread({ accept(bound) }, "airplay-screen").apply { isDaemon = true; start() }
         return bound.localPort
     }
 
+    internal fun close(cause: String) {
+        linkEnd.end(cause = cause, counters = true)
+        close()
+    }
+
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
+        linkEnd.end(counters = true)
         safeClose(socket)
         safeClose(server)
         thread?.interrupt()
@@ -61,9 +79,10 @@ class ScreenStream(private val key: ByteArray, private val onDiagnostic: (String
         try {
             val accepted = bound.accept()
             socket = accepted
+            linkEnd.reached = "tcp_accepted"
             run(accepted)
         } catch (error: Exception) {
-            if (!closed.get()) listener.onClosed(error)
+            if (!closed.get()) { linkEnd.failed(error, counters = true); listener.onClosed(error) }
         }
     }
 
@@ -76,16 +95,23 @@ class ScreenStream(private val key: ByteArray, private val onDiagnostic: (String
                 stats.reading()
                 val header = readFully(input, HEADER_LEN) ?: break
                 val bodySize = readU32Le(header, 0)
-                if (bodySize > MAX_BODY) break
+                if (bodySize < 0 || bodySize > MAX_BODY) {
+                    linkEnd.end("peer", "protocol_error", "invalid video body length", counters = true)
+                    break
+                }
                 val body = readFully(input, bodySize) ?: break
                 val arrivalNanos = System.nanoTime()
+                linkEnd.received(HEADER_LEN + bodySize)
+                linkEnd.reached = "receiving"
                 stats.received(HEADER_LEN + bodySize)
                 onMessage(header, body, stats, arrivalNanos)
                 stats.processed()
             }
         } catch (error: Exception) {
             failure = error
+            if (!closed.get()) linkEnd.failed(error, counters = true)
         } finally {
+            if (!closed.get()) linkEnd.end("peer", "peer_eof", counters = true)
             stats.flush(ended = true)
             if (socket === sock) socket = null
             safeClose(sock)

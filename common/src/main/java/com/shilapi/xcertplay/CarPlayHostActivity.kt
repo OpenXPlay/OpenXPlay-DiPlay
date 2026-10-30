@@ -5932,6 +5932,7 @@ class CarPlayHostActivity : ComponentActivity() {
                 setConnectionStage("$reason\n${getString(R.string.wireless_startup_retries_exhausted)}",
                     "$englishReason\n${englishResources.getString(R.string.wireless_startup_retries_exhausted)}")
             }
+            controller?.endConnection("stop")
             appendLog("wireless startup recovery stopped generation=$restartGeneration reason=$startupFailure retries=${startupRetryBudget.retries}")
             return
         }
@@ -5955,7 +5956,8 @@ class CarPlayHostActivity : ComponentActivity() {
             appendLog(message)
         }
         reconnectAttempts += 1
-        appendLog("$reason; retrying in ${delayMillis}ms generation=$generation startupFailure=$startupFailure startupRetries=${startupRetryBudget.retries}")
+        controller?.endConnection(if (minimumDelayMillis > 0) "wait_iphone" else "rebuild", delayMillis)
+        appendLog("$reason; retrying in ${delayMillis}ms generation=$generation startupFailure=$startupFailure startupRetries=${startupRetryBudget.retries} next=${if (minimumDelayMillis > 0) "wait_iphone" else "rebuild"} nextInMs=$delayMillis")
         mainHandler.postDelayed(
             {
                 reconnectScheduled = false
@@ -5996,6 +5998,7 @@ class CarPlayHostActivity : ComponentActivity() {
         val size = activeDisplaySize ?: return
         startupRetryBudget.disconnected()
         startupRetryButton?.visibility = View.GONE
+        controller?.endConnection("rebuild", 0)
         appendLog(reason)
         activeScreenStreamTypes.clear()
         ClusterActivityOutput.setStreamActive(false)

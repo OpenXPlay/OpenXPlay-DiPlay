@@ -96,7 +96,10 @@ class CarPlayMediaEngineTest {
     }
 
     private fun testSession(videoInCar: Boolean = false): AirPlaySession = AirPlaySession(
-        socket = Socket(),
+        socket = object : Socket() {
+            override fun getInetAddress() = java.net.InetAddress.getLoopbackAddress()
+            override fun getRemoteSocketAddress() = java.net.InetSocketAddress(inetAddress, 7000)
+        },
         config = AirPlayConfig(
             deviceName = "test",
             deviceId = "02:00:00:00:00:02",

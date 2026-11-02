@@ -4,6 +4,9 @@
 package com.shilapi.xcertplay
 
 import android.app.Application
+import android.bluetooth.BluetoothAdapter
+import android.content.BroadcastReceiver
+import android.content.Intent
 import android.os.Handler
 import android.os.Looper
 import android.view.View
@@ -13,6 +16,7 @@ import com.shilapi.xcertplay.airplay.AirPlayConfig
 import com.shilapi.xcertplay.airplay.AirPlayDisplayConfig
 import com.shilapi.xcertplay.airplay.AirPlayIdentity
 import com.shilapi.xcertplay.airplay.AirPlayMediaHandler
+import com.shilapi.xcertplay.airplay.AirPlaySession
 import com.shilapi.xcertplay.airplay.AirPlaySessionListener
 import com.shilapi.xcertplay.airplay.PairingStore
 import com.shilapi.xcertplay.host.R
@@ -26,7 +30,9 @@ import com.shilapi.xcertplay.orchestration.CarPlayRuntimeConfig
 import com.shilapi.xcertplay.orchestration.CarPlayStatus
 import com.shilapi.xcertplay.orchestration.CarPlayTransport
 import com.shilapi.xcertplay.orchestration.MfiTarget
+import com.shilapi.xcertplay.orchestration.WirelessConnectionPolicyProvider
 import com.shilapi.xcertplay.transport.Iap2IdentificationConfig
+import com.shilapi.xcertplay.orchestration.ConnectionFailureCause
 import com.shilapi.xcertplay.transport.BluetoothLinkCheck
 import com.shilapi.xcertplay.transport.BluetoothRadioCheck
 import org.junit.After
@@ -36,11 +42,13 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.LooperMode
 import org.robolectric.util.ReflectionHelpers
 import org.robolectric.util.ReflectionHelpers.ClassParameter.from
 import java.io.IOException
+import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
 @RunWith(RobolectricTestRunner::class)
@@ -52,6 +60,12 @@ class WirelessStartupRecoveryTest {
         override val carPlayEventObserver = object : CarPlayEventObserver {
             override fun onLinkEnded(end: CarPlayLinkEnd) { ends += end }
         }
+    }
+
+    class ReconnectPolicyApplication : Application(), WirelessConnectionPolicyProvider {
+        override val wirelessNetworkRecoveryEnabled = false
+        override val cancelRecoveredRetries = false
+        override val awaitIphoneReconnect = true
     }
 
     private val controllers = mutableListOf<CarPlayController>()
@@ -70,6 +84,11 @@ class WirelessStartupRecoveryTest {
 
     @After fun cleanup() {
         controllers.forEach { it.close(); assertTrue(it.awaitClosed(2_000)) }
+        for (name in listOf("teardownExecutor", "airPlayCommandExecutor")) {
+            val executor = ReflectionHelpers.getField<java.util.concurrent.ExecutorService>(activity, name)
+            executor.shutdownNow()
+            assertTrue(executor.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS))
+        }
         org.robolectric.Shadows.shadowOf(Looper.getMainLooper()).idle()
         ReflectionHelpers.getField<Handler>(activity, "mainHandler").removeCallbacksAndMessages(null)
         CarPlayBackgroundSession.clear()
@@ -185,11 +204,13 @@ class WirelessStartupRecoveryTest {
         noteFailure(controller)
         ReflectionHelpers.callInstanceMethod<Unit>(activity, "reconnectAfterLoss",
             from(String::class.java, "AirPlay session ended"), from(WirelessStartupFailure::class.java, null),
-            from(String::class.java, "AirPlay session ended"), from(Long::class.javaPrimitiveType, 25_000L))
+            from(String::class.java, "AirPlay session ended"), from(Long::class.javaPrimitiveType, 25_000L),
+            from(ConnectionFailureCause::class.java, null))
         assertDecision(controller, CarPlayTransport.WIRELESS, "wait_iphone", "25000")
     }
 
     @Test fun recoveredControlCancelsQueuedRetryButAnotherLossKeepsItEligible() {
+        allowRestart()
         val log = java.io.File.createTempFile("retry-recovered", ".log")
         ReflectionHelpers.setField(activity, "sessionLog", SessionLogFile(log))
         report()
@@ -199,10 +220,54 @@ class WirelessStartupRecoveryTest {
         org.robolectric.Shadows.shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(35))
         assertFalse(ReflectionHelpers.getField(activity, "reconnectScheduled"))
         assertEquals(0, ReflectionHelpers.getField<Int>(activity, "restartGeneration"))
+        assertTrue(ReflectionHelpers.getField<SessionLogFile>(activity, "sessionLog").awaitIdle(2_000))
         assertTrue(log.readText().contains("cancelling queued retry"))
         log.delete()
         report(status = CarPlayStatus.ControlEnded)
         assertTrue(ReflectionHelpers.getField(activity, "lossSinceControlRunning"))
+    }
+
+    private fun allowRestart() {
+        val size = Class.forName("com.shilapi.xcertplay.CarPlayHostActivity\$DisplaySize")
+            .getDeclaredConstructor(Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+            .apply { isAccessible = true }.newInstance(800, 480)
+        ReflectionHelpers.setField(activity, "activeDisplaySize", size)
+    }
+
+    private fun runQueuedRetry() {
+        val pending = ReflectionHelpers.getField<Runnable>(activity, "pendingReconnect")
+        ReflectionHelpers.getField<Handler>(activity, "mainHandler").removeCallbacks(pending)
+        pending.run()
+        assertFalse(ReflectionHelpers.getField(activity, "reconnectScheduled"))
+        assertNull(ReflectionHelpers.getField<Runnable?>(activity, "pendingReconnect"))
+    }
+
+    @Test @Config(application = ReconnectPolicyApplication::class)
+    fun hostCanKeepRetryingAfterTheSameAttemptRecovers() {
+        allowRestart()
+        report()
+        report(status = CarPlayStatus.RunningWireless)
+        runQueuedRetry()
+        assertEquals(1, ReflectionHelpers.getField<Int>(activity, "restartGeneration"))
+    }
+
+    @Test fun anotherLossAfterRecoveryStillRebuildsTheSameAttempt() {
+        allowRestart()
+        report()
+        report(status = CarPlayStatus.RunningControl)
+        report(status = CarPlayStatus.ControlEnded)
+        runQueuedRetry()
+        assertEquals(1, ReflectionHelpers.getField<Int>(activity, "restartGeneration"))
+    }
+
+    @Test @Config(application = ReconnectPolicyApplication::class)
+    fun newerAirPlaySessionCancelsRetryIndependentlyOfRecoveredControlPolicy() {
+        allowRestart()
+        report()
+        ReflectionHelpers.setField(activity, "airPlaySessionActivations", 1L)
+        ReflectionHelpers.setField(activity, "activeAirPlaySession", org.mockito.Mockito.mock(AirPlaySession::class.java))
+        runQueuedRetry()
+        assertEquals(0, ReflectionHelpers.getField<Int>(activity, "restartGeneration"))
     }
 
     @Test fun duplicateFailureAndCleanupErrorScheduleOnlyOneRetry() {
@@ -273,6 +338,20 @@ class WirelessStartupRecoveryTest {
         assertEquals(View.VISIBLE, retry.visibility)
     }
 
+    // The driver refused Android's prompt to turn the car hotspot off: a retry would only show it again.
+    @Test fun wifiDirectRefusedBesideTheCarHotspotSaysSoAndDoesNotRetry() {
+        val stage = TextView(activity)
+        ReflectionHelpers.setField(activity, "stageStatusView", stage)
+        report(status = CarPlayStatus.Failed("Could not establish WIFI_P2P hotspot: " +
+            "Android was not allowed to turn the car hotspot off for Wi-Fi Direct",
+            startupFailure = WirelessStartupFailure.WIFI_DIRECT_BESIDE_HOTSPOT))
+        assertEquals(activity.getString(R.string.wifi_direct_refused_beside_hotspot), stage.text.toString())
+        assertEquals(0, budget().retries)
+        assertFalse(ReflectionHelpers.getField(activity, "reconnectScheduled"))
+        assertTrue(ReflectionHelpers.getField(activity, "startupRetryStopped"))
+        assertEquals(View.VISIBLE, retry.visibility)
+    }
+
     // The driver can switch Bluetooth on, so the screen asks for it and the attempts go on.
     @Test fun bluetoothThatIsOffAsksForItAndKeepsRetrying() {
         val stage = TextView(activity)
@@ -282,6 +361,36 @@ class WirelessStartupRecoveryTest {
         assertTrue(ReflectionHelpers.getField(activity, "reconnectScheduled"))
         assertFalse(ReflectionHelpers.getField(activity, "startupRetryStopped"))
         assertEquals(View.GONE, retry.visibility)
+    }
+
+    // The back-off had reached 30 s on a Galaxy Note20: Bluetooth on, then half a minute of
+    // "Connecting to your iPhone…" before the next attempt.
+    @Test fun bluetoothTurningOnRunsTheRetryThatWaitsForIt() {
+        ReflectionHelpers.setField(activity, "reconnectAttempts", 4)
+        report(status = CarPlayStatus.Failed(BluetoothRadioCheck.RADIO_OFF))
+        val pending = ReflectionHelpers.getField<Runnable>(activity, "pendingReconnect")
+        val handler = ReflectionHelpers.getField<Handler>(activity, "mainHandler")
+        assertTrue(handler.hasCallbacks(pending))
+        bluetooth(BluetoothAdapter.STATE_TURNING_ON)
+        shadowOf(Looper.getMainLooper()).idle()
+        assertTrue(ReflectionHelpers.getField(activity, "reconnectScheduled"))
+        bluetooth(BluetoothAdapter.STATE_ON)
+        shadowOf(Looper.getMainLooper()).idle()
+        assertFalse(ReflectionHelpers.getField(activity, "reconnectScheduled"))
+        // It ran once, now; the delayed copy is gone.
+        assertFalse(handler.hasCallbacks(pending))
+    }
+
+    @Test fun bluetoothTurningOnLeavesAnyOtherRetryOnItsDelay() {
+        report()
+        bluetooth(BluetoothAdapter.STATE_ON)
+        shadowOf(Looper.getMainLooper()).idle()
+        assertTrue(ReflectionHelpers.getField(activity, "reconnectScheduled"))
+    }
+
+    private fun bluetooth(state: Int) {
+        ReflectionHelpers.getField<BroadcastReceiver>(activity, "bluetoothOnReceiver").onReceive(activity,
+            Intent(BluetoothAdapter.ACTION_STATE_CHANGED).putExtra(BluetoothAdapter.EXTRA_STATE, state))
     }
 
     /** Fails every attempt with [status] until the retries stop, checking the screen names [cause] meanwhile. */
@@ -302,6 +411,8 @@ class WirelessStartupRecoveryTest {
 
     private val hotspotNotReady = CarPlayStatus.Failed("Could not establish MANUAL hotspot: Hotspot network is not ready",
         startupFailure = WirelessStartupFailure.HOTSPOT_NOT_READY)
+    private val carHotspotOff = CarPlayStatus.Failed("The car hotspot is off. Turn it on in the car settings and connect again.",
+        startupFailure = WirelessStartupFailure.HOTSPOT_CONFIGURATION)
 
     // #809: the screen said "Getting CarPlay ready…" while the car hotspot never came up, and after the retries stopped.
     @Test fun aHotspotThatIsNotReadyIsNamedAndTheStopIsSaid() =
@@ -347,6 +458,62 @@ class WirelessStartupRecoveryTest {
         assertEquals(stopped, stage.text.toString())
         assertFalse(ReflectionHelpers.getField(activity, "reconnectScheduled"))
         assertEquals(View.VISIBLE, retry.visibility)
+    }
+
+    @Test fun aKnownCauseIsNamedAndRetriedAsBefore() {
+        val stage = TextView(activity)
+        ReflectionHelpers.setField(activity, "stageStatusView", stage)
+        val log = File(activity.filesDir, "known-cause.log")
+        ReflectionHelpers.setField(activity, "sessionLog", SessionLogFile(log))
+        val notPaired = "The selected iPhone is no longer paired. Choose it again in DiPlay."
+        report(status = CarPlayStatus.Failed(notPaired, knownCause = ConnectionFailureCause.CHOSEN_IPHONE_NOT_PAIRED))
+        assertEquals(activity.getString(R.string.chosen_iphone_not_paired), stage.text.toString())
+        assertEquals(0, budget().retries)
+        assertTrue(ReflectionHelpers.getField(activity, "reconnectScheduled"))
+        assertFalse(ReflectionHelpers.getField(activity, "startupRetryStopped"))
+        assertEquals(View.GONE, retry.visibility)
+        assertTrue(ReflectionHelpers.getField<SessionLogFile>(activity, "sessionLog").awaitIdle(2_000))
+        assertTrue(log.readText(), log.readText().contains("Failed: $notPaired; retrying in 2000ms generation=0 startupFailure=null"))
+    }
+
+    @Test fun aHotspotCauseIsNamedUntilTheRetriesStop() = assertNamedUntilRetriesStop(
+        hotspotNotReady.copy(knownCause = ConnectionFailureCause.HOTSPOT_INTERFACE_NOT_FOUND), R.string.hotspot_interface_not_found)
+
+    @Test fun aCarHotspotThatIsOffIsNamedWhereTheRetriesStop() {
+        val stage = TextView(activity)
+        ReflectionHelpers.setField(activity, "stageStatusView", stage)
+        report(status = carHotspotOff.copy(knownCause = ConnectionFailureCause.CAR_HOTSPOT_OFF))
+        assertEquals(activity.getString(R.string.car_hotspot_is_off) + "\n" +
+            activity.getString(R.string.wireless_startup_retries_exhausted), stage.text.toString())
+        assertEquals(0, budget().retries)
+        assertFalse(ReflectionHelpers.getField(activity, "reconnectScheduled"))
+        assertEquals(View.VISIBLE, retry.visibility)
+    }
+
+    private data class Retries(val logWithoutTimes: List<String>, val used: Int)
+
+    private fun retries(status: CarPlayStatus.Failed): Retries {
+        cleanup()
+        setup()
+        val log = File.createTempFile("retries", ".log", activity.filesDir)
+        ReflectionHelpers.setField(activity, "sessionLog", SessionLogFile(log))
+        repeat(6) { generation ->
+            ReflectionHelpers.setField(activity, "restartGeneration", generation)
+            ReflectionHelpers.setField(activity, "reconnectScheduled", false)
+            report(generation, status)
+        }
+        assertTrue(ReflectionHelpers.getField<SessionLogFile>(activity, "sessionLog").awaitIdle(2_000))
+        return Retries(log.readLines().map { it.substringAfter("  ") }, budget().retries)
+    }
+
+    @Test fun aHotspotCauseLeavesTheRetriesAndTheLogAsTheyWere() {
+        val notReady = retries(hotspotNotReady)
+        assertEquals(5, notReady.used)
+        assertTrue(notReady.toString(), notReady.logWithoutTimes.any { "retrying in" in it })
+        assertEquals(notReady, retries(hotspotNotReady.copy(knownCause = ConnectionFailureCause.HOTSPOT_INTERFACE_NOT_FOUND)))
+        val off = retries(carHotspotOff)
+        assertTrue(off.toString(), off.logWithoutTimes.any { "wireless startup recovery stopped" in it })
+        assertEquals(off, retries(carHotspotOff.copy(knownCause = ConnectionFailureCause.CAR_HOTSPOT_OFF)))
     }
 
     @Test fun staleGenerationUserDisconnectMenuAndDifferentOwnerCannotSchedule() {

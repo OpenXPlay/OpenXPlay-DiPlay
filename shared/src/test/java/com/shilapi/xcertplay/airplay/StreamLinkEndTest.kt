@@ -16,7 +16,7 @@ class StreamLinkEndTest {
     @Test fun screenEofThenLocalCleanupReportsOneEndWithCounters() {
         val ends = CopyOnWriteArrayList<CarPlayLinkEnd>()
         val ended = CountDownLatch(1)
-        val stream = ScreenStream(ByteArray(32)).apply {
+        val stream = ScreenStream(ByteArray(32), InetAddress.getLoopbackAddress()).apply {
             onLinkEnded = { ends += it; ended.countDown() }
         }
         try {

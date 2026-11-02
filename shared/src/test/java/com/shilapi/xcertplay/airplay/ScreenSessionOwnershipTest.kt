@@ -34,8 +34,13 @@ class ScreenSessionOwnershipTest {
         override fun onScreenStreamActive(type: Int, active: Boolean) { activeScreens[type] = active; if (type == 110) states += active }
         override fun onVideoFrame(type: Int, naluBytes: ByteArray) { frames += naluBytes[0].toInt() }
     }
-    private fun session(engine: CarPlayMediaEngine, observer: AirPlaySessionListener = object : AirPlaySessionListener {}) = AirPlaySession(
-        socket = Socket(),
+    private fun session(engine: CarPlayMediaEngine, observer: AirPlaySessionListener = object : AirPlaySessionListener {},
+        hasPeer: Boolean = true) = AirPlaySession(
+        socket = object : Socket() {
+            override fun getInetAddress() = java.net.InetAddress.getLoopbackAddress()
+            override fun getRemoteSocketAddress() =
+                if (hasPeer) java.net.InetSocketAddress(inetAddress, 7000) else null
+        },
         config = AirPlayConfig(deviceName = "test", deviceId = "02:00:00:00:00:02", btMac = "02:00:00:00:00:01",
             sourceVersion = "1.0", main = AirPlayDisplayConfig(widthPixels = 800, heightPixels = 480)),
         identity = AirPlayIdentity.generate(), pairings = PairingStore(), mfi = null,
@@ -51,6 +56,23 @@ class ScreenSessionOwnershipTest {
         val screen = streams.getValue(CarPlayMediaEngine.StreamKey(peer, type)) as ScreenStream
         return ScreenStream::class.java.getDeclaredField("listener").apply { isAccessible = true }.get(screen) as ScreenStream.Listener
     }
+    @Test fun missingControlPeerDoesNotRetireTheCurrentScreen() {
+        val sink = RecordingSink()
+        val engine = CarPlayMediaEngine(sink)
+        val current = session(engine)
+        val peerless = session(engine, hasPeer = false)
+        try {
+            assertNotNull(engine.onScreen(current, 110, mapOf("streamConnectionID" to 1L)))
+            assertNull(engine.onScreen(peerless, 110, mapOf("streamConnectionID" to 2L)))
+            peerless.close()
+            listener(engine, current).onFrame(byteArrayOf(1))
+            assertEquals(listOf(1), sink.frames)
+            assertTrue(sink.active)
+            current.close()
+            assertFalse(sink.active)
+        } finally { current.close(); peerless.close() }
+    }
+
     @Test fun closingOldSessionMustNotDeactivateTheNewMainScreen() {
         val sink = RecordingSink()
         val engine = CarPlayMediaEngine(sink)

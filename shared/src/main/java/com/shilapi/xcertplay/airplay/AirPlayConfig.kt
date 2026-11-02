@@ -100,6 +100,13 @@ data class AirPlayConfig(
     val speechWithout8And16Khz: Boolean = false,
     /** When set, SETUP enables iAPChannel only if the iPhone's features list contains it. */
     val iapChannelOnlyWhenOffered: Boolean = false,
+    /**
+     * Calls arrive as a narrowband vocoder stream (8 kHz on the test car, `vocoderInfo`), which DiPlay otherwise
+     * plays through a 48 kHz Opus stream. When set, the call's output offer is PCM at 8, 16, 24 and 32 kHz only,
+     * so the iPhone picks the call's own rate, as the stock CarPlay receiver does. The call's microphone offer is
+     * restricted the same way, because the iPhone picks one format for both directions.
+     */
+    val callAtCallRate: Boolean = false,
 )
 
 /** The offer, SETUP and controls must all honor the user's audio-output setting. */

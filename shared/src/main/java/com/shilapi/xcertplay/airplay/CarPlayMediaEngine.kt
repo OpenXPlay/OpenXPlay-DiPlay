@@ -16,6 +16,7 @@ import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 /** Identity of one CarPlay audio stream: the stream type plus its CarPlay audio type. */
 data class AudioStreamId(val type: Int, val audioType: String)
@@ -37,6 +38,8 @@ interface MediaSink {
     fun onMicrophoneStarted(id: AudioStreamId, config: MicrophoneConfig) {}
     fun onMicrophoneStopped(id: AudioStreamId) {}
     fun onIapMessage(bytes: ByteArray) {}
+    /** The iPhone asked the car to duck its other audio for a navigation prompt (true), or to restore it. */
+    fun onAudioDuck(ducked: Boolean) {}
 }
 
 /**
@@ -127,6 +130,9 @@ class CarPlayMediaEngine(
 
     private class BufferedStream(val stream: BufferedAudioStream, val connectionId: Any?)
 
+    /** The session whose last duck command started a navigation prompt. */
+    private val duckingSession = AtomicReference<AirPlaySession?>()
+
     // The sink has one type-103 renderer, even while old control sessions remain connected.
     // Never hold this lock when closing/controlling a stream: sink callbacks can reenter us.
     private val bufferedOwnershipLock = Any()
@@ -154,9 +160,10 @@ class CarPlayMediaEngine(
 
     override fun onScreen(session: AirPlaySession, type: Int, stream: Map<String, Any?>): Int? {
         val key = outputKey(session, stream) ?: return null
+        val peer = session.remoteAddress ?: return null
         val streamKey = StreamKey(session, type)
         Log.i(TAG, "airplay screen key connectionID=${unsignedPlistDecimal(stream["streamConnectionID"])}")
-        val screen = ScreenStream(key, session::logDebug).apply {
+        val screen = ScreenStream(key, peer, session::logDebug).apply {
             onLinkEnded = { session.reportLinkEnd(it.copy(facts = it.facts + ("type" to "$type"))) }
         }
         val output = ScreenOutput(streamKey, screen)
@@ -215,7 +222,7 @@ class CarPlayMediaEngine(
                     sink.setVideoDiagnosticHandler(type) { message ->
                         // Do not hold the delivery lock while calling back into the controller.
                         if (synchronized(screenOwnershipLock) { ownsScreen(output) }) {
-                            if (message == "first frame rendered") session.videoFrameRendered()
+                            if (type == STREAM_TYPE_MAIN_SCREEN && message == "first frame rendered") session.videoFrameRendered()
                             session.logDebug("Video: $message")
                         }
                     }
@@ -333,7 +340,7 @@ class CarPlayMediaEngine(
                         session.logDebug(
                             "Audio: rtp clock type=$type audioType=$audioType " +
                                 "audioFormat=0x${java.lang.Long.toHexString((stream["audioFormat"] as? Number)?.toLong() ?: 0L)} " +
-                                "measuredHz=$hz microphoneClockHz=${microphone?.opusClockRate ?: "none"}",
+                                "measuredHz=$hz microphoneClockHz=${microphone?.rtpClockRate ?: "none"}",
                         )
                     }
                     sink.onAudioRtp(streamId, format, rtp, sample)
@@ -485,6 +492,7 @@ class CarPlayMediaEngine(
         if (uuid != IAP_DATASTREAM_UUID) return null
         val shared = session.sharedSecret ?: return null
         val seed = unsignedPlistDecimal(stream["seed"]) ?: return null
+        val peer = session.remoteAddress ?: return null
         session.logDebug(
             "AirPlay iAP SETUP uuid=$uuid seed=$seed " +
                 "streamConnectionID=${unsignedPlistDecimal(stream["streamConnectionID"]) ?: "none"}",
@@ -497,6 +505,7 @@ class CarPlayMediaEngine(
         )
         val tunnel = IapTunnel(
             readKey = key,
+            expectedPeer = peer,
             bindAddress = session.localAddress
                 ?: when (session.remoteAddress) {
                     is Inet6Address -> InetAddress.getByName("::")
@@ -557,10 +566,11 @@ class CarPlayMediaEngine(
         if (uuid != VideoInCar.SETTINGS_CHANNEL_UUID) return null
         val shared = session.sharedSecret ?: return null
         val seed = unsignedPlistDecimal(stream["seed"]) ?: return null
+        val peer = session.remoteAddress ?: return null
         fun key(label: String) = AirPlayCrypto.hkdfSha512(
             shared, "DataStream-Salt$seed".toByteArray(Charsets.US_ASCII), label.toByteArray(Charsets.US_ASCII), 32,
         )
-        val channel = VideoSettingsChannel(key(DATASTREAM_OUTPUT_KEY), key(DATASTREAM_INPUT_KEY)) { session.logDebug(it) }
+        val channel = VideoSettingsChannel(key(DATASTREAM_OUTPUT_KEY), key(DATASTREAM_INPUT_KEY), peer) { session.logDebug(it) }
         channel.onLinkEnded = { session.reportLinkEnd(it.copy(facts = it.facts + mapOf("type" to "130", "channel" to "video_settings"))) }
         val port = channel.listen(session.localAddress ?: InetAddress.getByName("::"))
         videoSettingsChannels.put(session, channel)?.close("replaced")
@@ -653,6 +663,11 @@ class CarPlayMediaEngine(
         }
     }
 
+    override fun onAudioDuck(session: AirPlaySession, ducked: Boolean) {
+        if (ducked) duckingSession.set(session) else duckingSession.compareAndSet(session, null)
+        sink.onAudioDuck(ducked)
+    }
+
     override fun onSessionClosed(session: AirPlaySession) {
         val screens = synchronized(screenOwnershipLock) {
             retireScreenSession(session)
@@ -661,6 +676,8 @@ class CarPlayMediaEngine(
             }
         }
         screens.forEach { it.stream.close() }
+        // A phone that disconnects during a prompt never sends unduckAudio.
+        if (duckingSession.compareAndSet(session, null)) sink.onAudioDuck(false)
         clearPendingIapTunnel(session)
         retireBuffered(session)
         videoSettingsChannels.remove(session)?.close()
@@ -757,7 +774,7 @@ class CarPlayMediaEngine(
         } else if (framesPerPacket > 0) {
             Math.round(framesPerPacket * 1000.0 / format.sampleRate).toInt().coerceIn(5, 60)
         } else {
-            20
+            MicrophoneConfig.pcmFrameMillis(format.sampleRate, format.channels)
         }
         val opusBitrate = when {
             formatBits and OPUS_48K != 0L -> 96_000

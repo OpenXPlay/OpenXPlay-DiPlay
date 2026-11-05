@@ -5985,7 +5985,9 @@ open class CarPlayHostActivity : ComponentActivity() {
 
     private fun displayLayoutChanged(newSize: DisplaySize? = activeDisplaySize): Boolean {
         val display = sessionDisplay ?: return false
-        if (display.rotation != displayRotation()) return true
+        // A canvas from the app is on another screen, which does not turn with this window.
+        val ownCanvas = (application as? CarPlayCanvasProvider)?.carPlayCanvas() == null
+        if (ownCanvas && display.rotation != displayRotation()) return true
         if (display.hideTopBar != hideTopBar || display.hideBottomBar != hideBottomBar) return true
         if (newSize != null && newSize.width > 0 && newSize.height > 0 &&
             display.windowWidth > 0 && display.windowHeight > 0) {

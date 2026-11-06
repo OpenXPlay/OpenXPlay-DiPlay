@@ -1,6 +1,7 @@
 package com.shilapi.xcertplay.network
 
 import java.net.InetAddress
+import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
 import org.junit.Assert.*
@@ -34,6 +35,26 @@ class AirPlayDualListenerTest {
                 assertNotEquals(busy.localPort, servers.first().localPort)
                 ServerSocket(busy.localPort, 50, addresses[0]).use { assertTrue(it.isBound) }
             } finally { servers.forEach { it.close() } }
+        }
+    }
+
+    @Test fun exportedAttachFailureDistinguishesAnOccupiedPortFromAnUnavailableAddress() {
+        val loopback = addresses[1]
+        val unavailable = InetAddress.getByName("2001:db8::1")
+        assertNull(NetworkInterface.getByInetAddress(unavailable))
+        ServerSocket(0, 50, loopback).use { busy ->
+            val failure = assertThrows(java.net.BindException::class.java) {
+                AirPlayPortSelector.bindAll(listOf(loopback, unavailable), busy.localPort, emptyList())
+            }
+            assertEquals("No common AirPlay port available for the selected interface addresses", failure.message)
+            val detail = CarPlayVpnService.attachFailure(failure)
+            val interfaceIndex = NetworkInterface.getByInetAddress(loopback).index
+            assertTrue(detail, detail.contains("family=IPv4 interfaceIndex=$interfaceIndex cause=BindException errno=EADDRINUSE"))
+            assertTrue(detail, detail.contains("family=IPv6 interfaceIndex=unknown cause=BindException errno=EADDRNOTAVAIL"))
+            assertFalse(detail, detail.contains(loopback.hostAddress!!))
+            assertFalse(detail, detail.contains(unavailable.hostAddress!!))
+            assertEquals(2, failure.suppressed.size)
+            assertTrue(failure.suppressed.all { it is java.net.BindException })
         }
     }
 

@@ -448,6 +448,7 @@ class CarPlayVpnService : VpnService() {
          * exception chain and the frame that threw, so the rejected VPN setting can be identified.
          */
         internal fun attachFailure(error: Throwable): String {
+            if (error is AirPlayDualBindException) return "${error.message}: ${error.diagnostics}"
             val chain = generateSequence(error) { it.cause }.take(4).joinToString(" <- ") { failure ->
                 "${failure.javaClass.simpleName}: ${failure.message ?: "no message"}"
             }
